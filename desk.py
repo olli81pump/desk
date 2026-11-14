@@ -22,6 +22,8 @@ from fees import round_trip_fees
 import settings as S
 from rpcutil import Rpc, bonding_curve_pda
 from sources import HttpSources, rugcheck_creator
+from pathlib import Path as _P
+ROOT_DIR_CLOSE = _P(__file__).resolve().parent / "data"
 from notify import Telegram, paper, buy_keyboard, sell_keyboard
 from publisher import publish, write_state
 from snapshot import build as build_snapshot
@@ -679,6 +681,12 @@ class Desk:
                         await self.tg.send(paper(f"{name}: no price for 1 min"), sell_keyboard(mint))
                 continue
             misses[mint] = 0
+            # manual close requests (one mint per line in data/close_requests.txt)
+            req = ROOT_DIR_CLOSE / "close_requests.txt"
+            if req.exists() and mint in req.read_text().split():
+                req.write_text("\n".join(m for m in req.read_text().split() if m != mint))
+                await self._close_position(p, price, "manual")
+                continue
             # liquidity pulled
             liq = dex.get("liquidity_usd") if dex else None
             try:
