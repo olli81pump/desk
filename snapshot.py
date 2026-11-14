@@ -193,8 +193,8 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
                 "paused": bool(paused.get("risk")),
                 "heartbeat": hb.get("risk"),
                 "pills": {
-                    "stop": f"Stop −{s.get('stop_pct')}%",
-                    "trail": f"Trail {s.get('trail_pct')}%",
+                    "stop": f"Stop −{float(s.get('stop_pct') or 0):g}%",
+                    "trail": f"Trail {float(s.get('trail_pct') or 0):g}%",
                     "tp": f"TP {s.get('tp1_pct'):g}%/{s.get('tp2_pct'):g}%",
                 },
             },

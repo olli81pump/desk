@@ -86,7 +86,7 @@ def _summary(trades: list[dict], start_stack: float | None) -> dict:
         dd = peak - eq
         if dd > mdd:
             mdd = dd
-            mdd_pct = (dd / peak * 100) if peak > 0 else 0.0
+            mdd_pct = (dd / peak * 100) if (peak > 0 and start_stack is not None) else 0.0
     holds = []
     for t in trades:
         a, b = _dt(t.get("opened_at")), _dt(t.get("closed_at"))
