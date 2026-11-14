@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from links import SIGNUP_URL, coin_url, profile_url
+from stats import build_stats
 
 
 def _row(r) -> dict:
@@ -113,12 +114,21 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
     mode = s.get("mode") or "PAPER"
     stack = float(s["paper_balance"] if mode == "PAPER" else (s.get("live_stack") or 0) or 0)
     ticket = extra.get("ticket") if extra else None
+    try:
+        stats = await build_stats(db, s, coin_url)
+    except Exception as e:  # stats must never break the snapshot
+        stats = {"error": type(e).__name__}
 
     return {
         "mode": mode,
         "ts": iso_now(),
         "balance": stack if mode == "PAPER" else s.get("live_stack"),
         "stack": stack,
+        "balances": {
+            "PAPER": round(float(s.get("paper_balance") or 0), 2),
+            "LIVE": round(float(s.get("live_stack") or 0), 2) if s.get("live_stack") is not None else None,
+        },
+        "stats": stats,
         "fomo_handle": s.get("fomo_handle") or "olli81",
         "signup_url": SIGNUP_URL,
         "profile_url": profile_url(s.get("fomo_handle") or "olli81"),
@@ -137,24 +147,24 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
         "agents": {
             "scanner": {
                 "name": "Scanner",
-                "card": f"{len(waiting)} pools",
-                "sub": f"{passed_n} passed · {killed_n} killed",
+                "card": f"{len(waiting)} Pools",
+                "sub": f"{passed_n} ok · {killed_n} raus",
                 "paused": bool(paused.get("scanner")),
                 "heartbeat": hb.get("scanner"),
                 "feed": scan_feed,
             },
             "auditor": {
                 "name": "Auditor",
-                "card": f"{audits_n} taken apart",
-                "sub": f"{rejected_a} rejected" if rejected_a else "idle",
+                "card": f"{audits_n} geprüft",
+                "sub": f"{rejected_a} abgelehnt" if rejected_a else "bereit",
                 "paused": bool(paused.get("auditor")),
                 "heartbeat": hb.get("auditor"),
                 "latest": latest_audit,
             },
             "analyst": {
                 "name": "Analyst",
-                "card": "Scoring",
-                "sub": f"mode rules · {analyses_n} scored",
+                "card": "Bewertet",
+                "sub": f"Regeln · {analyses_n} bewertet",
                 "paused": bool(paused.get("analyst")),
                 "heartbeat": hb.get("analyst"),
                 "min_score": s.get("min_score"),
@@ -171,20 +181,20 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
             },
             "executor": {
                 "name": "Executor",
-                "card": f"{trades_n} trades",
-                "sub": "Brain sizes",
+                "card": f"{trades_n} Trades",
+                "sub": "Größe vom Brain",
                 "paused": bool(paused.get("executor")),
                 "heartbeat": hb.get("executor"),
             },
             "risk": {
                 "name": "Risk",
-                "card": "Guarding" if positions else "Idle",
+                "card": "Wacht" if positions else "Bereit",
                 "sub": _last_exit_label(activity),
                 "paused": bool(paused.get("risk")),
                 "heartbeat": hb.get("risk"),
                 "pills": {
-                    "stop": f"stop -{s.get('stop_pct')}%",
-                    "trail": f"trail {s.get('trail_pct')}%",
+                    "stop": f"Stop −{s.get('stop_pct')}%",
+                    "trail": f"Trail {s.get('trail_pct')}%",
                     "tp": f"TP {s.get('tp1_pct'):g}%/{s.get('tp2_pct'):g}%",
                 },
             },
@@ -302,17 +312,17 @@ def _last_exit_label(activity: list[dict]) -> str:
     for a in activity:
         if a.get("kind") in {"sold", "stopped", "trailed", "timeout", "pulled", "took_profit"}:
             if a.get("kind") == "stopped":
-                return "Stopped"
+                return "Zuletzt: Stop"
             if a.get("kind") in {"sold", "trailed"}:
-                return "Trailed out"
+                return "Zuletzt: verkauft"
             if a.get("kind") == "took_profit":
-                return "Took profit"
+                return "Zuletzt: Teilgewinn"
             return a.get("title") or a.get("kind")
-    return "No exits yet"
+    return "Noch keine Exits"
 
 
 def _brain_card(s: dict, n: int) -> str:
-    return f"{n} sized" if n else "Sizing"
+    return f"{n} dimensioniert" if n else "Bereit"
 
 
 def _json(v):
