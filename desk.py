@@ -612,6 +612,8 @@ class Desk:
             # PAPER: fill anyway so the night stays honest
             payload["reason"] = "push failed"
         self.pushed_tonight.add(mint)
+        if mode == "LIVE":
+            await self._send_channel_buy(name, mint, size, stack_pct)
         if True:  # PAPER fills; LIVE tracks the signal as if the user tapped Buy
             # fill at signal price when the push goes out
             payload["status"] = "bought"
@@ -856,6 +858,7 @@ class Desk:
                 await asyncio.sleep(3)
                 continue
             for u in updates:
+                await self._maybe_register_channel(u)
                 msg = u.get("message") or u.get("edited_message") or {}
                 chat = str((msg.get("chat") or {}).get("id") or "")
                 if chat != str(self.tg.owner):
@@ -869,6 +872,36 @@ class Desk:
                     log.exception("command")
                     reply, kb = "Something went wrong on that command.", None
                 await self.tg.send(reply, kb)
+
+    async def _maybe_register_channel(self, u: dict) -> None:
+        """Remember the signal channel when the bot is made admin there, or the owner forwards a channel post."""
+        from notify import save_channel_id, load_channel_id
+        cid, title = None, None
+        mcm = u.get("my_chat_member") or {}
+        chat = mcm.get("chat") or {}
+        if chat.get("type") == "channel" and (mcm.get("new_chat_member") or {}).get("status") == "administrator":
+            cid, title = chat.get("id"), chat.get("title")
+        msg = u.get("message") or {}
+        if str((msg.get("chat") or {}).get("id") or "") == str(self.tg.owner):
+            fc = msg.get("forward_from_chat") or ((msg.get("forward_origin") or {}).get("chat")) or {}
+            if fc.get("type") == "channel":
+                cid, title = fc.get("id"), fc.get("title")
+        cp = u.get("channel_post") or {}
+        if cp and not load_channel_id() and (cp.get("chat") or {}).get("type") == "channel":
+            cid, title = cp["chat"].get("id"), cp["chat"].get("title")
+        if cid and str(cid) != str(load_channel_id() or ""):
+            save_channel_id(str(cid))
+            await self.tg.send(f"Kanal verbunden: {title or cid}. Kaufsignale gehen ab jetzt auch dorthin.")
+
+    async def _send_channel_buy(self, name: str, mint: str, size: float, stack_pct: float) -> None:
+        from notify import load_channel_id
+        cid = load_channel_id()
+        if not cid or not self.tg:
+            return
+        try:
+            await self.tg.send_to(cid, f"🟢 Kaufsignal · {name} · ${size:.2f} ({stack_pct:.0f}% vom Stack)", buy_keyboard(mint))
+        except Exception:
+            log.exception("channel send")
 
     # ----- publisher -----
     async def publisher_loop(self) -> None:

@@ -78,13 +78,16 @@ class Telegram:
         if self._own and self._session and not self._session.closed:
             await self._session.close()
 
-    async def send(self, text: str, keyboard: dict | None = None, retries: int = 3) -> bool:
+    async def send_to(self, chat_id: str, text: str, keyboard: dict | None = None) -> bool:
+        return await self.send(text, keyboard, retries=3, chat_id=chat_id)
+
+    async def send(self, text: str, keyboard: dict | None = None, retries: int = 3, chat_id: str | None = None) -> bool:
         if not self.ok:
             log.warning("telegram not configured; drop message")
             return False
         sess = await self._sess()
         payload: dict[str, Any] = {
-            "chat_id": self.owner,
+            "chat_id": chat_id or self.owner,
             "text": text,
             "disable_web_page_preview": True,
         }
@@ -108,7 +111,7 @@ class Telegram:
         if not self.ok:
             return []
         sess = await self._sess()
-        params = {"offset": self.offset, "timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        params = {"offset": self.offset, "timeout": timeout, "allowed_updates": ["message", "callback_query", "my_chat_member", "channel_post"]}
         try:
             async with sess.get(self._url("getUpdates"), params=params) as r:
                 data = await r.json()
@@ -126,3 +129,20 @@ class Telegram:
 async def asyncio_sleep(n: float) -> None:
     import asyncio
     await asyncio.sleep(n)
+
+
+CHANNEL_FILE = SECRETS / "signal_channel_id"
+
+
+def load_channel_id() -> str | None:
+    if CHANNEL_FILE.exists():
+        return CHANNEL_FILE.read_text().strip() or None
+    return None
+
+
+def save_channel_id(cid: str) -> None:
+    CHANNEL_FILE.write_text(str(cid))
+    try:
+        CHANNEL_FILE.chmod(0o600)
+    except OSError:
+        pass
