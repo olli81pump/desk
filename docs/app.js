@@ -509,8 +509,8 @@
         <div class="lbl">${esc(c.symbol || "")} · ${esc(String(mint).slice(0, 4))}…${esc(String(mint).slice(-4))}</div></div>
         <div class="pnl"><div class="a">${price(last)}</div><div class="b ${cls(chg)}">${spct(chg)} im Fenster</div></div></div>
       <canvas class="big" id="chart"></canvas>
-      <div class="legend" style="padding-top:6px"><span><i></i>Kurs</span><span><i style="background:var(--muted)"></i>Einstieg</span><span><i style="background:var(--orange)"></i>${pos && pos.trail_active ? "Trail" : "Stop"}</span><span><i style="background:var(--green)"></i>TP1/TP2</span></div>
-      ${pos ? posCard(Object.assign({}, pos, { prices: c.prices, pct: pos.pct, last_price: pos.last_price })).replace(/<canvas[^>]*><\/canvas>/, "") : `<div class="acts"><a class="btn" href="${esc(c.link)}" target="_blank" rel="noopener">AUF FOMO ÖFFNEN ↗</a></div>`}
+      <div class="legend" style="padding-top:6px"><span><i style="background:var(--green)"></i>Kurs</span><span><i style="background:var(--muted)"></i>Einstieg</span><span><i style="background:var(--orange)"></i>${pos && pos.trail_active ? "Trail" : "Stop"}</span><span><i style="background:var(--green)"></i>TP1/TP2</span></div>
+      ${pos ? posCard(Object.assign({}, pos, { prices: c.prices, pct: pos.pct, last_price: pos.last_price })).replace(/<canvas[^>]*><\/canvas>/, "").replace(/<button class="btn ghost"[^>]*>CHART<\/button>/, "") : `<div class="acts"><a class="btn" href="${esc(c.link)}" target="_blank" rel="noopener">AUF FOMO ÖFFNEN ↗</a></div>`}
       <div class="sec"><h2>Auditor</h2></div>
       ${c.audit && c.audit.layers ? layersGrid(c.audit.layers) : `<div class="empty">Kein Audit.</div>`}`;
   }
