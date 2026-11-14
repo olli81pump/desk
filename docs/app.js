@@ -43,12 +43,30 @@
   let emptyFixture = false;
 
   function dataPath() {
-    const fromHash = parseHash().data;
+    const fromHash = parseHash().data || new URLSearchParams(location.search).get("d");
     if (fromHash) {
       localStorage.setItem(LS_KEY, fromHash);
       return fromHash;
     }
     return localStorage.getItem(LS_KEY);
+  }
+
+  function showPathPrompt() {
+    const root = document.getElementById("app") || document.body;
+    root.innerHTML = `<div style="padding:24px 16px;font:17px -apple-system,system-ui;color:#fff">
+      <div style="font-size:22px;font-weight:600;margin-bottom:8px">Zugang einrichten</div>
+      <div style="color:rgba(235,235,245,.6);margin-bottom:16px">Füge den Zugangscode aus dem Grok-Bot-Chat ein. Das ist nur einmal nötig.</div>
+      <input id="dpIn" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Zugangscode"
+        style="width:100%;box-sizing:border-box;height:48px;border-radius:12px;border:0;background:#1c1c1e;color:#fff;padding:0 14px;font:16px ui-monospace,monospace">
+      <button id="dpBtn" style="margin-top:12px;width:100%;height:50px;border-radius:14px;border:0;background:#00d35a;color:#000;font:600 17px -apple-system,system-ui">Speichern</button>
+    </div>`;
+    document.getElementById("dpBtn").onclick = () => {
+      let v = (document.getElementById("dpIn").value || "").trim();
+      const m = v.match(/[#&?]d=([^&]+)/); if (m) v = decodeURIComponent(m[1]);
+      if (v.length < 20) return;
+      localStorage.setItem(LS_KEY, v);
+      location.reload();
+    };
   }
 
   async function load() {
@@ -68,9 +86,9 @@
     }
     const dp = dataPath();
     if (!dp) {
-      error = "Kein Datenpfad. Öffne die App einmal als URL#d=… (Wert liegt in .secrets/DATA_PATH).";
       state = null;
-      render();
+      error = null;
+      showPathPrompt();
       return;
     }
     const url = `d/${encodeURIComponent(dp)}/state.json?ts=${Date.now()}`;
