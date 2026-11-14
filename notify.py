@@ -43,11 +43,14 @@ def sell_keyboard(mint: str, chain: str = "solana") -> dict:
     }
 
 
-def paper(text: str) -> str:
+MODE = "PAPER"  # set by desk on load / switch
+
+
+def paper(text: str, mode: str | None = None) -> str:
     t = text.strip()
-    if t.startswith("PAPER"):
+    if t.startswith("PAPER") or t.startswith("LIVE"):
         return t
-    return "PAPER · " + t
+    return ("LIVE · " if (mode or MODE) == "LIVE" else "PAPER · ") + t
 
 
 class Telegram:

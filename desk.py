@@ -28,6 +28,7 @@ from snapshot import build as build_snapshot
 from agents.scanner import scanner_pass
 from agents import auditor as auditor_mod
 from agents import analyst as analyst_mod
+from agents import brain as brain_mod
 from agents import executor as executor_mod
 from agents import risk as risk_mod
 import commands as cmds
@@ -47,7 +48,7 @@ def _setup_logging() -> None:
     fh = logging.FileHandler(LOG_DIR / "desk.log")
     fh.setFormatter(fmt)
     root.addHandler(fh)
-    for agent in ("scanner", "auditor", "analyst", "executor", "risk"):
+    for agent in ("scanner", "auditor", "analyst", "brain", "executor", "risk"):
         h = logging.FileHandler(LOG_DIR / f"{agent}.log")
         h.setFormatter(fmt)
         logging.getLogger(agent).addHandler(h)
@@ -65,6 +66,7 @@ class Desk:
         self.tg: Telegram | None = None
         self.bus_auditor: asyncio.Queue = asyncio.Queue()
         self.bus_analyst: asyncio.Queue = asyncio.Queue()
+        self.bus_brain: asyncio.Queue = asyncio.Queue()
         self.bus_executor: asyncio.Queue = asyncio.Queue()
         self.night = current_night(self.settings.get("report_time") or "08:00")
         self.ticket: dict | None = None
@@ -85,6 +87,8 @@ class Desk:
             self.settings["mode"] = "PAPER"
         if self.settings.get("paper_balance") is None:
             self.settings["paper_balance"] = self.settings["paper_start_stack"]
+        import notify as _notify
+        _notify.MODE = self.settings["mode"]
         await self.db.save_settings(self.settings)
         self.night = current_night(self.settings.get("report_time") or "08:00")
         await self.db.execute(
@@ -447,8 +451,8 @@ class Desk:
         name = scan.get("name") or mint
         link = coin_url(mint, "solana")
         if result["passed"]:
-            await self.db.upsert_coin(mint=mint, status="executor")
-            await self.bus_executor.put({"scan": scan, "audit": audit, "analysis": result, "dex": dex})
+            await self.db.upsert_coin(mint=mint, status="brain")
+            await self.bus_brain.put({"scan": scan, "audit": audit, "analysis": result, "dex": dex})
         else:
             await self.db.upsert_coin(mint=mint, status="rejected")
             failed = (result.get("failed") or ["?"])[0]
@@ -460,6 +464,64 @@ class Desk:
             if self.settings.get("push_rejects"):
                 await self.announce(paper(f"Rejected {name} / Analyst (rules) · {failed}"))
         logging.getLogger("analyst").info("%s score=%s passed=%s %s", mint, result.get("score"), result.get("passed"), result.get("failed"))
+
+    async def brain_loop(self) -> None:
+        while self.running:
+            await self.beat("brain")
+            try:
+                item = await asyncio.wait_for(self.bus_brain.get(), timeout=5)
+            except asyncio.TimeoutError:
+                continue
+            if await self.is_paused("brain"):
+                await self.bus_brain.put(item)
+                await asyncio.sleep(1)
+                continue
+            try:
+                await self._brain_item(item)
+            except Exception:
+                log.exception("brain item")
+
+    async def _brain_item(self, item: dict) -> None:
+        scan, dex0, analysis = item["scan"], item["dex"], item["analysis"]
+        mint = scan["mint"]
+        mode = self.settings.get("mode") or "PAPER"
+        stack = float(self.settings["paper_balance"] if mode == "PAPER" else (self.settings.get("live_stack") or 0) or 0)
+        openp = await self.db.open_positions()
+        in_use = sum(float(p["size_usd"] or 0) for p in openp)
+        free = stack - in_use
+        score = analysis.get("score")
+        liq = dex0.get("liquidity_usd") if dex0 else None
+        sized = brain_mod.size_buy(score, liq, stack, free, self.settings, mint=mint)
+        sized["night"] = self.night
+        sized["ts"] = datetime.now(timezone.utc).isoformat()
+        await self.db.add_brain(sized)
+        name = scan.get("name") or (dex0 or {}).get("name") or mint
+        link = coin_url(mint, "solana")
+        logging.getLogger("brain").info(
+            "%s score=%s size=%s cap=%s skipped=%s %s",
+            mint, sized.get("score"), sized.get("sizeUsd"), sized.get("capHit"),
+            sized.get("skipped"), sized.get("reason"),
+        )
+        if sized.get("skipped"):
+            await self.db.upsert_coin(mint=mint, status="skipped")
+            await self.db.add_skip(mint, sized.get("reason") or "brain skip", self.night)
+            await self.db.add_activity(
+                kind="skipped", mint=mint, title=f"Skipped {name}",
+                agent="Brain", detail=sized.get("reason") or "under min size",
+                right="Skipped", link=link, tone="reject", night=self.night,
+            )
+            return
+        await self.db.upsert_coin(mint=mint, status="executor")
+        cap = f" · cap {sized['capHit']}" if sized.get("capHit") else ""
+        await self.db.add_activity(
+            kind="sized", mint=mint, title=f"Sized {name}",
+            agent="Brain",
+            detail=f"score {sized['score']:.0f}{cap}",
+            right=f"${sized['sizeUsd']:.2f} · {sized['stackPct']:.2f}% of stack",
+            link=link, tone="pass", night=self.night,
+        )
+        item["brain"] = sized
+        await self.bus_executor.put(item)
 
     async def executor_loop(self) -> None:
         while self.running:
@@ -487,15 +549,22 @@ class Desk:
         mode = self.settings.get("mode") or "PAPER"
         stack = float(self.settings["paper_balance"] if mode == "PAPER" else (self.settings.get("live_stack") or 0) or 0)
         openp = await self.db.open_positions()
-        in_use = sum(float(p["size_usd"] or 0) for p in openp)
+        in_use = sum(float(p["size_usd"] or 0) for p in openp if (p["mode"] or "PAPER") == mode)
         free = stack - in_use
-        # ticket skip mode may block every coin
+        # ticket skip only if the stack cannot fund Brain's minimum size
         chk = S.ticket_check(self.settings, stack)
         self.ticket = chk
         if chk.get("block"):
             payload = executor_mod.execution_payload(mint, 0, 0, stack, coin_url(mint, "solana"), mode, "skipped", chk["warning"])
             await self.db.add_execution(payload)
             await self.db.add_skip(mint, chk["warning"], self.night)
+            return
+        brain = item.get("brain") or {}
+        size = float(brain.get("sizeUsd") or 0)
+        if size <= 0:
+            payload = executor_mod.execution_payload(mint, 0, 0, stack, coin_url(mint, "solana"), mode, "skipped", brain.get("reason") or "no brain size")
+            await self.db.add_execution(payload)
+            await self.db.add_skip(mint, brain.get("reason") or "no brain size", self.night)
             return
         # fresh dex read
         freshmap = await self.http.dexscreener([mint])
@@ -518,18 +587,18 @@ class Desk:
             await self.db.add_execution(payload)
             await self.db.add_skip(mint, reason, self.night)
             return
-        sized = executor_mod.size_position(stack, fresh.get("liquidity_usd"), self.settings, free=free)
+        # Executor no longer sizes: take Brain's ticket, re-check free stack
+        if size > free + 1e-9:
+            payload = executor_mod.execution_payload(mint, signal_price, 0, stack, coin_url(mint, "solana"), mode, "skipped", "not enough free stack")
+            await self.db.add_execution(payload)
+            await self.db.add_skip(mint, "not enough free stack", self.night)
+            return
         link = coin_url(mint, "solana")
         name = scan.get("name") or fresh.get("name") or mint
-        if sized["skipped"]:
-            payload = executor_mod.execution_payload(mint, signal_price, 0, stack, link, mode, "skipped", sized["reason"])
-            await self.db.add_execution(payload)
-            await self.db.add_skip(mint, sized["reason"], self.night)
-            return
-        size = sized["size"]
+        stack_pct = float(brain.get("stackPct") or ((size / stack * 100.0) if stack else 0.0))
         payload = executor_mod.execution_payload(mint, signal_price, size, stack, link, mode, "sent")
         # push
-        text = paper(f"{name} · ${size:.2f} · {sized['stack_pct_effective']:.2f}% of stack")
+        text = paper(f"{name} · ${size:.2f} · {stack_pct:.2f}% of stack")
         sent = await self.tg.send(text, buy_keyboard(mint), retries=3) if self.tg else False
         if not sent:
             logging.getLogger("executor").warning("push failed %s", mint)
@@ -541,29 +610,27 @@ class Desk:
             # PAPER: fill anyway so the night stays honest
             payload["reason"] = "push failed"
         self.pushed_tonight.add(mint)
-        if mode == "PAPER":
+        if True:  # PAPER fills; LIVE tracks the signal as if the user tapped Buy
             # fill at signal price when the push goes out
             payload["status"] = "bought"
             await self.db.add_execution(payload)
             await self.db.c.execute(
                 "INSERT INTO positions(mint,name,symbol,status,mode,opened_at,entry_price,peak_price,"
-                "size_usd,stop_pct,trail_active,link,night) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                "size_usd,stop_pct,trail_active,link,night,original_size_usd,realized_pnl_usd,"
+                "tp1_hit,tp2_hit,fees_realized_usd) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?,?,0,0,0,0)",
                 (
-                    mint, name, scan.get("symbol") or fresh.get("symbol"), "open", "PAPER",
+                    mint, name, scan.get("symbol") or fresh.get("symbol"), "open", mode,
                     datetime.now(timezone.utc).isoformat(), signal_price, signal_price,
-                    size, float(self.settings["stop_pct"]), link, self.night,
+                    size, float(self.settings["stop_pct"]), link, self.night, size,
                 ),
             )
             await self.db.c.commit()
             await self.db.add_activity(
                 kind="bought", mint=mint, title=f"Bought {name}", agent="Executor",
                 detail=datetime.now(timezone.utc).strftime("%H:%M"),
-                right=f"${size:.2f} · {sized['stack_pct_effective']:.2f}% of stack",
+                right=f"${size:.2f} · {stack_pct:.2f}% of stack",
                 link=link, tone="buy", night=self.night,
             )
-        else:
-            await self.db.add_execution(payload)
-            # LIVE: wait for Bought; confirm window handled by a watcher
         logging.getLogger("executor").info("%s size=%s status=%s", mint, size, payload["status"])
 
     # ----- risk -----
@@ -627,45 +694,129 @@ class Desk:
                     (ev["peak"], 1 if ev["trail_active"] else 0, p["id"]),
                 )
             logging.getLogger("risk").info(
-                "%s price=%s peak=%s stop=%s trail=%s action=%s",
-                mint, price, ev["peak"], ev["stop_line"], ev["trail_line"], ev["reason"],
+                "%s price=%s peak=%s stop=%s trail=%s action=%s partials=%s",
+                mint, price, ev["peak"], ev["stop_line"], ev["trail_line"], ev["reason"], ev.get("partials"),
             )
             if ev["reason"]:
                 await self._close_position(p, price, ev["reason"])
+                continue
+            for part in ev.get("partials") or []:
+                p = await self._take_profit(p, price, part)
+                if p is None or float(p.get("size_usd") or 0) <= 1e-9:
+                    break
+
+    def _frac_label(self, fraction: float) -> str:
+        if abs(fraction - 1.0 / 3.0) < 0.02 or abs(fraction - 0.333) < 0.02:
+            return "1/3"
+        if abs(fraction - 0.5) < 0.02:
+            return "1/2"
+        if abs(fraction - 2.0 / 3.0) < 0.02:
+            return "2/3"
+        return f"{fraction * 100:.0f}%"
+
+    async def _take_profit(self, p: dict, price: float, part: dict) -> dict | None:
+        """PAPER fill a slice of the original size at the polled price, with fees."""
+        which = part["kind"]
+        frac = float(part.get("fraction") or 0)
+        orig = float(p.get("original_size_usd") or p["size_usd"] or 0)
+        remaining = float(p.get("size_usd") or 0)
+        sold = min(orig * frac, remaining)
+        if sold <= 1e-9:
+            return p
+        discount = float(self.settings.get("fees_ref_discount") or 0)
+        fees = round_trip_fees(sold, discount)
+        net, pct = risk_mod.pnl(float(p["entry_price"]), price, sold, fees)
+        new_remaining = remaining - sold
+        realized = float(p.get("realized_pnl_usd") or 0) + net
+        fees_realized = float(p.get("fees_realized_usd") or 0) + fees
+        name = p["name"] or p["symbol"] or p["mint"]
+        link = p.get("link") or coin_url(p["mint"], "solana")
+        label = self._frac_label(frac)
+        tp_pct = float(part.get("pct") or 0)
+        mode = p.get("mode") or "PAPER"
+        if new_remaining <= 1e-9:
+            status = "closed"
+            closed_at = datetime.now(timezone.utc).isoformat()
+            await self.db.execute(
+                "UPDATE positions SET size_usd=?, realized_pnl_usd=?, fees_realized_usd=?,"
+                " tp1_hit=?, tp2_hit=?, tp1_price=?, tp2_price=?,"
+                " status=?, closed_at=?, exit_price=?, exit_reason=?, pnl_usd=?, fees_usd=?, pct=? WHERE id=?",
+                (
+                    0, realized, fees_realized,
+                    1 if which == "tp1" or p.get("tp1_hit") else 0,
+                    1 if which == "tp2" or p.get("tp2_hit") else 0,
+                    price if which == "tp1" else p.get("tp1_price"),
+                    price if which == "tp2" else p.get("tp2_price"),
+                    status, closed_at, price, which, realized, fees_realized, pct, p["id"],
+                ),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE positions SET size_usd=?, realized_pnl_usd=?, fees_realized_usd=?,"
+                f" {which}_hit=1, {which}_price=? WHERE id=?",
+                (new_remaining, realized, fees_realized, price, p["id"]),
+            )
+        bkey = "paper_balance" if mode == "PAPER" else "live_stack"
+        self.settings[bkey] = float(self.settings.get(bkey) or 0) + net
+        await self.db.save_settings(self.settings)
+        sign_n = "+" if net >= 0 else "-"
+        text = paper(f"Took {label} profit on {name} · {sign_n}${abs(net):.2f} ({pct:+.2f}%)", mode)
+        if self.tg:
+            await self.tg.send(text, sell_keyboard(p["mint"]))
+        right = f"+${net:.2f}" if net >= 0 else f"-${abs(net):.2f}"
+        await self.db.add_activity(
+            kind="took_profit", mint=p["mint"], title=f"Took profit {name}",
+            agent="Risk", detail=f"+{tp_pct:g}% · {label}",
+            right=right, link=link, tone="good" if net >= 0 else "bad", night=self.night,
+        )
+        logging.getLogger("risk").info(
+            "%s %s sold=$%s remaining=$%s net=$%s", p["mint"], which, sold, new_remaining, net,
+        )
+        if new_remaining <= 1e-9:
+            return None
+        p = dict(p)
+        p["size_usd"] = new_remaining
+        p["realized_pnl_usd"] = realized
+        p["fees_realized_usd"] = fees_realized
+        p[f"{which}_hit"] = 1
+        p[f"{which}_price"] = price
+        return p
 
     async def _close_position(self, p: dict, price: float, reason: str) -> None:
         mode = p.get("mode") or "PAPER"
-        fees = round_trip_fees(float(p["size_usd"]), float(self.settings.get("fees_ref_discount") or 0))
-        net, pct = risk_mod.pnl(float(p["entry_price"]), price, float(p["size_usd"]), fees)
+        remaining = float(p["size_usd"] or 0)
+        fees = round_trip_fees(remaining, float(self.settings.get("fees_ref_discount") or 0))
+        net, pct = risk_mod.pnl(float(p["entry_price"]), price, remaining, fees)
+        realized = float(p.get("realized_pnl_usd") or 0)
+        fees_realized = float(p.get("fees_realized_usd") or 0)
+        total_pnl = realized + net
+        total_fees = fees_realized + fees
         name = p["name"] or p["symbol"] or p["mint"]
         link = p.get("link") or coin_url(p["mint"], "solana")
         stop_pct = float(p["stop_pct"])
-        if mode == "PAPER":
-            # close immediately; apply pnl to simulated balance
+        if True:
+            # close immediately; apply this slice's pnl to simulated balance (partials already booked)
             await self.db.execute(
-                "UPDATE positions SET status=?, closed_at=?, exit_price=?, exit_reason=?, pnl_usd=?, fees_usd=?, pct=? WHERE id=?",
-                ("closed", datetime.now(timezone.utc).isoformat(), price, reason, net, fees, pct, p["id"]),
+                "UPDATE positions SET status=?, closed_at=?, exit_price=?, exit_reason=?, "
+                "pnl_usd=?, fees_usd=?, pct=?, size_usd=0, realized_pnl_usd=? WHERE id=?",
+                ("closed", datetime.now(timezone.utc).isoformat(), price, reason, total_pnl, total_fees, pct, total_pnl, p["id"]),
             )
-            self.settings["paper_balance"] = float(self.settings.get("paper_balance") or 0) + net
+            bkey = "paper_balance" if mode == "PAPER" else "live_stack"
+            self.settings[bkey] = float(self.settings.get(bkey) or 0) + net
             await self.db.save_settings(self.settings)
-        else:
-            await self.db.execute(
-                "UPDATE positions SET status=?, exit_price=?, exit_reason=?, pnl_usd=?, fees_usd=?, pct=? WHERE id=?",
-                ("exiting", price, reason, net, fees, pct, p["id"]),
-            )
         # push
         if reason == "trail":
-            text = paper(f"Sold {name} · +${net:.2f} ({pct:+.2f}%)" if net >= 0 else f"Sold {name} · ${net:.2f} ({pct:+.2f}%)")
+            text = paper(f"Sold {name} · +${net:.2f} ({pct:+.2f}%)" if net >= 0 else f"Sold {name} · ${net:.2f} ({pct:+.2f}%)", mode)
             # specified: "Sold {name} · +${pnl} (+{pct}%)"
             sign_n = "+" if net >= 0 else ""
             sign_p = "+" if pct >= 0 else ""
-            text = paper(f"Sold {name} · {sign_n}${abs(net):.2f} ({sign_p}{pct:.2f}%)") if net >= 0 else paper(f"Sold {name} · -${abs(net):.2f} ({pct:.2f}%)")
+            text = paper(f"Sold {name} · {sign_n}${abs(net):.2f} ({sign_p}{pct:.2f}%)", mode) if net >= 0 else paper(f"Sold {name} · -${abs(net):.2f} ({pct:.2f}%)", mode)
         elif reason == "stop":
-            text = paper(f"{name} hit the -{stop_pct:g}% stop · -${abs(net):.2f}")
+            text = paper(f"{name} hit the -{stop_pct:g}% stop · -${abs(net):.2f}", mode)
         elif reason == "timeout":
-            text = paper(f"Sell {name}, dead money · {pct:.2f}% in {self.settings['timeout_h']:g}h")
+            text = paper(f"Sell {name}, dead money · {pct:.2f}% in {self.settings['timeout_h']:g}h", mode)
         else:
-            text = paper(f"Sell {name}, {reason}")
+            text = paper(f"Sell {name}, {reason}", mode)
         if self.tg:
             await self.tg.send(text, sell_keyboard(p["mint"]))
         tone = "good" if net >= 0 and reason != "stop" else "bad"
@@ -748,6 +899,7 @@ async def amain() -> None:
         asyncio.create_task(desk.scanner_poll(), name="scanner_poll"),
         asyncio.create_task(desk.auditor_loop(), name="auditor"),
         asyncio.create_task(desk.analyst_loop(), name="analyst"),
+        asyncio.create_task(desk.brain_loop(), name="brain"),
         asyncio.create_task(desk.executor_loop(), name="executor"),
         asyncio.create_task(desk.risk_loop(), name="risk"),
         asyncio.create_task(desk.telegram_loop(), name="telegram"),
