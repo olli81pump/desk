@@ -903,6 +903,41 @@ class Desk:
         except Exception:
             log.exception("channel send")
 
+    async def self_watchdog(self) -> None:
+        """If any agent loop stops beating for 3 min, dump all task stacks to the log and exit so the wrapper restarts us."""
+        import io, os as _os
+        await asyncio.sleep(180)
+        while self.running:
+            await asyncio.sleep(30)
+            try:
+                hb = await self.db.heartbeats()
+                now = datetime.now(timezone.utc)
+                stale = []
+                for a in ("scanner", "auditor", "analyst", "brain", "executor", "risk", "telegram", "publisher"):
+                    ts = hb.get(a)
+                    try:
+                        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00")) if ts else None
+                    except Exception:
+                        t = None
+                    if t is None or (now - t).total_seconds() > 180:
+                        stale.append(a)
+                if stale:
+                    buf = io.StringIO()
+                    for task in asyncio.all_tasks():
+                        buf.write(f"--- task {task.get_name()} done={task.done()}\n")
+                        if task.done() and not task.cancelled() and task.exception():
+                            buf.write(f"exception: {task.exception()!r}\n")
+                        task.print_stack(file=buf)
+                    log.error("self-watchdog: stale %s, exiting for restart\n%s", stale, buf.getvalue())
+                    for h in logging.getLogger().handlers:
+                        try:
+                            h.flush()
+                        except Exception:
+                            pass
+                    _os._exit(3)
+            except Exception:
+                log.exception("self-watchdog")
+
     # ----- publisher -----
     async def publisher_loop(self) -> None:
         while self.running:
@@ -946,6 +981,7 @@ async def amain() -> None:
         asyncio.create_task(desk.telegram_loop(), name="telegram"),
         asyncio.create_task(desk.publisher_loop(), name="publisher"),
         asyncio.create_task(desk.night_rollover(), name="night"),
+        asyncio.create_task(desk.self_watchdog(), name="self_watchdog"),
     ]
     stop = asyncio.Event()
 

@@ -3,5 +3,5 @@
 cd "$(dirname "$0")/.."
 while true; do
   sleep 120
-  .venv/bin/python scripts/health_check.py >> logs/watchdog.log 2>&1
+  echo "$(date -Iseconds) check" >> logs/watchdog.log; timeout 90 .venv/bin/python scripts/health_check.py >> logs/watchdog.log 2>&1
 done
