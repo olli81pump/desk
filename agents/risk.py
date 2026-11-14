@@ -16,7 +16,7 @@ def tighter_stop(old_pct: float, new_pct: float) -> float:
 
 
 def evaluate(pos: dict, price: float, now: datetime | None, s: dict | None = None) -> dict:
-    """Apply peak / stop / trail / timeout in that order. pos is not mutated until applied."""
+    """Apply peak / stop / take-profit / trail / timeout. pos is not mutated until applied."""
     now = now or datetime.now(timezone.utc)
     entry = float(pos["entry_price"])
     peak = max(float(pos.get("peak_price") or entry), float(price))
@@ -33,10 +33,10 @@ def evaluate(pos: dict, price: float, now: datetime | None, s: dict | None = Non
         opened_dt = opened
 
     reason = None
-    # stop
+    # stop on the remaining position
     if price <= entry * (1.0 - stop_pct / 100.0):
         reason = "stop"
-    # trail on
+    # trail on (also after a partial — remaining keeps the trail)
     if price >= entry * (1.0 + trail_start / 100.0):
         trail_active = True
     # trail
@@ -47,13 +47,27 @@ def evaluate(pos: dict, price: float, now: datetime | None, s: dict | None = Non
         if now - opened_dt >= timedelta(hours=timeout_h) and price < entry * (1.0 + timeout_min_gain / 100.0):
             reason = "timeout"
 
+    tp1_pct = float((s or {}).get("tp1_pct") if (s or {}).get("tp1_pct") is not None else 50)
+    tp2_pct = float((s or {}).get("tp2_pct") if (s or {}).get("tp2_pct") is not None else 100)
+    tp1_frac = float((s or {}).get("tp1_fraction") if (s or {}).get("tp1_fraction") is not None else 0.333)
+    tp2_frac = float((s or {}).get("tp2_fraction") if (s or {}).get("tp2_fraction") is not None else 0.333)
+    partials: list[dict] = []
+    if reason is None:
+        if not pos.get("tp1_hit") and price >= entry * (1.0 + tp1_pct / 100.0):
+            partials.append({"kind": "tp1", "pct": tp1_pct, "fraction": tp1_frac})
+        if not pos.get("tp2_hit") and price >= entry * (1.0 + tp2_pct / 100.0):
+            partials.append({"kind": "tp2", "pct": tp2_pct, "fraction": tp2_frac})
+
     return {
         "peak": peak,
         "trail_active": trail_active,
         "reason": reason,
+        "partials": partials,
         "exit_price": price if reason else None,
         "stop_line": entry * (1.0 - stop_pct / 100.0),
         "trail_line": peak * (1.0 - trail_pct / 100.0) if trail_active else None,
+        "tp1_line": entry * (1.0 + tp1_pct / 100.0),
+        "tp2_line": entry * (1.0 + tp2_pct / 100.0),
     }
 
 

@@ -13,47 +13,65 @@ DOCS = ROOT / "docs"
 OUT = ROOT / "screens"
 OUT.mkdir(parents=True, exist_ok=True)
 
+import sys
+sys.path.insert(0, str(ROOT))
+from links import SIGNUP_URL, coin_url, profile_url
+
+DEMO_MINT = "DemoMint11111111111111111111111111111111111"
+DEMO_LINK = coin_url(DEMO_MINT, "solana")
+THIN_LINK = coin_url("Thin", "solana")
+
 # A rich fixture so Coin / Auditor / Agents have something to show
 FIXTURE = {
     "mode": "PAPER",
     "ts": "2026-11-14T08:00:00+00:00",
-    "balance": 214.55,
-    "stack": 214.55,
+    "balance": 52.40,
+    "stack": 52.40,
     "fomo_handle": "olli81",
-    "signup_url": "https://fomo.family/r/olli81",
-    "profile_url": "https://fomo.family/profile/olli81?r=olli81",
+    "signup_url": SIGNUP_URL,
+    "profile_url": profile_url("olli81"),
     "notifier": "telegram",
     "notifier_note": "Web-Push ist in Plan B nicht verfügbar. Meldungen kommen über Telegram.",
     "settings": {
         "mode": "PAPER", "stop_pct": 6, "trail_pct": 12, "trail_start_pct": 20,
-        "stack_pct": 8, "min_ticket_usd": 47.5, "analyst_mode": "rules",
+        "stack_pct": 8, "min_ticket_usd": 5, "min_size_usd": 5, "max_size_usd": 10,
+        "max_pool_pct": 2, "tp1_pct": 50, "tp1_fraction": 0.333, "tp2_pct": 100, "tp2_fraction": 0.333,
+        "analyst_mode": "rules",
         "fomo_handle": "olli81", "notifier": "telegram", "rpc_url": "https://api.mainnet-beta.solana.com",
     },
-    "ticket_warning": "tickets bumped to $47.50 = 23.75% of stack",
+    "ticket_warning": None,
     "positions": [{
         "mint": "DemoMint11111111111111111111111111111111111",
         "name": "Demo Cat", "symbol": "DCAT", "status": "open", "mode": "PAPER",
-        "entry_price": 0.0012, "peak_price": 0.0015, "size_usd": 47.5,
+        "entry_price": 0.0012, "peak_price": 0.00186, "size_usd": 6.67,
+        "original_size_usd": 10, "realized_pnl_usd": 1.55,
         "stop_pct": 6, "trail_active": True,
-        "link": "https://fomo.family/tokens/solana/DemoMint11111111111111111111111111111111111?r=olli81",
+        "tp1_hit": True, "tp2_hit": False, "tp1_pct": 50, "tp2_pct": 100,
+        "tp1_fraction": 0.333, "tp2_fraction": 0.333,
+        "link": DEMO_LINK,
     }],
     "activity": [
-        {"ts": "2026-11-14T07:00:00+00:00", "kind": "stopped", "mint": "X", "title": "Stopped Old",
-         "agent": "Risk", "detail": "Risk · -6% stop", "right": "-$3.20 / -6.10%",
-         "link": "https://fomo.family/tokens/solana/OldMint?r=olli81", "tone": "bad"},
+        {"ts": "2026-11-14T07:00:00+00:00", "kind": "took_profit", "mint": "DemoMint11111111111111111111111111111111111",
+         "title": "Took profit Demo Cat",
+         "agent": "Risk", "detail": "+50% · 1/3", "right": "+$1.55",
+         "link": DEMO_LINK, "tone": "good"},
         {"ts": "2026-11-14T07:10:00+00:00", "kind": "bought", "mint": "DemoMint11111111111111111111111111111111111",
          "title": "Bought Demo Cat", "agent": "Executor", "detail": "08:10",
-         "right": "$47.50 · 23.75% of stack",
-         "link": "https://fomo.family/tokens/solana/DemoMint11111111111111111111111111111111111?r=olli81", "tone": "buy"},
+         "right": "$10.00 · 20.00% of stack",
+         "link": DEMO_LINK, "tone": "buy"},
+        {"ts": "2026-11-14T07:09:00+00:00", "kind": "sized", "mint": "DemoMint11111111111111111111111111111111111",
+         "title": "Sized Demo Cat", "agent": "Brain", "detail": "score 100",
+         "right": "$10.00 · 20.00% of stack",
+         "link": DEMO_LINK, "tone": "pass"},
         {"ts": "2026-11-14T06:50:00+00:00", "kind": "kill", "mint": "Thin", "title": "ThinLiq",
          "agent": "Scanner", "detail": "liq $12.0K", "right": "liq $12.0K",
-         "link": "https://fomo.family/tokens/solana/Thin?r=olli81", "tone": "kill"},
+         "link": THIN_LINK, "tone": "kill"},
     ],
     "waiting": [],
     "latest_audit": {
         "mint": "DemoMint11111111111111111111111111111111111",
         "name": "Demo Cat", "passed": True, "reason": None, "holders": 1200,
-        "link": "https://fomo.family/tokens/solana/DemoMint11111111111111111111111111111111111?r=olli81",
+        "link": DEMO_LINK,
         "layers": [
             {"n": 1, "name": "Mint authority", "pass": True, "value": "Revoked"},
             {"n": 2, "name": "Freeze authority", "pass": True, "value": "Revoked"},
@@ -68,16 +86,22 @@ FIXTURE = {
     "agents": {
         "scanner": {"name": "Scanner", "card": "3 pools", "sub": "2 passed · 4 killed", "feed": [
             {"mint": "DemoMint11111111111111111111111111111111111", "name": "Demo Cat", "verdict": "pass",
-             "liq": 52000, "link": "https://fomo.family/tokens/solana/DemoMint11111111111111111111111111111111111?r=olli81"},
+             "liq": 52000, "link": DEMO_LINK},
             {"mint": "Thin", "name": "ThinLiq", "verdict": "kill", "reason": "liq $12.0K",
-             "link": "https://fomo.family/tokens/solana/Thin?r=olli81"},
+             "link": THIN_LINK},
         ]},
         "auditor": {"name": "Auditor", "card": "2 taken apart", "sub": "0 rejected"},
         "analyst": {"name": "Analyst", "card": "Scoring", "sub": "mode rules · 1 scored", "min_score": 70,
                     "last": {"score": 78, "passed": True, "model": "rules"}},
-        "executor": {"name": "Executor", "card": "1 trades", "sub": "8% of stack"},
-        "risk": {"name": "Risk", "card": "Guarding", "sub": "Stopped",
-                 "pills": {"stop": "stop -6%", "trail": "trail 12%"}},
+        "brain": {"name": "Brain", "card": "1 sized", "sub": "$5–$10",
+                  "decisions": [
+                      {"mint": "DemoMint11111111111111111111111111111111111", "name": "Demo Cat", "score": 100,
+                       "sizeUsd": 10, "stackPct": 20, "skipped": False,
+                       "link": DEMO_LINK}
+                  ]},
+        "executor": {"name": "Executor", "card": "1 trades", "sub": "Brain sizes"},
+        "risk": {"name": "Risk", "card": "Guarding", "sub": "Took profit",
+                 "pills": {"stop": "stop -6%", "trail": "trail 12%", "tp": "TP 50%/100%"}},
     },
     "coins": {},
 }
@@ -87,13 +111,14 @@ FIXTURE["coins"] = {
     "DemoMint11111111111111111111111111111111111": {
         "mint": "DemoMint11111111111111111111111111111111111",
         "name": "Demo Cat", "symbol": "DCAT", "status": "open",
-        "link": "https://fomo.family/tokens/solana/DemoMint11111111111111111111111111111111111?r=olli81",
+        "link": DEMO_LINK,
         "prices": prices,
         "audit": FIXTURE["latest_audit"],
         "position": FIXTURE["positions"][0],
         "stop_pct": 6,
     }
 }
+FIXTURE["positions"][0]["prices"] = prices
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):

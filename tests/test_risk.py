@@ -92,4 +92,30 @@ if __name__ == "__main__":
     ev81 = risk_mod.evaluate(pos(entry=100, peak=100, stop=8, opened=now.isoformat()), 91.9, now, s)
     ev82 = risk_mod.evaluate(pos(entry=100, peak=100, stop=8, opened=now.isoformat()), 100 * (1-0.081), now, s)
     check(ev82["reason"] == "stop", f"new position stops at -8.1% ({ev82})")
+
+    # partials at +50 / +100 then trail exit on the remainder
+    evp1 = risk_mod.evaluate(pos(entry=100, peak=100, opened=now.isoformat()), 150, now, s)
+    kinds1 = [x["kind"] for x in evp1.get("partials") or []]
+    check(evp1["reason"] is None and kinds1 == ["tp1"] and evp1["trail_active"], f"+50% takes TP1 only {evp1}")
+    evp2 = risk_mod.evaluate(pos(entry=100, peak=150, trail_active=True, tp1_hit=1, opened=now.isoformat()), 200, now, s)
+    kinds2 = [x["kind"] for x in evp2.get("partials") or []]
+    check(evp2["reason"] is None and kinds2 == ["tp2"], f"+100% after TP1 takes TP2 {evp2}")
+    # gap through both
+    evgap = risk_mod.evaluate(pos(entry=100, peak=100, opened=now.isoformat()), 200, now, s)
+    kindsG = [x["kind"] for x in evgap.get("partials") or []]
+    check(evgap["reason"] is None and kindsG == ["tp1", "tp2"], f"gap to +100% takes TP1 then TP2 {evgap}")
+    # after both partials, 13% off the peak trails out the remaining third
+    evtr = risk_mod.evaluate(
+        pos(entry=100, peak=200, trail_active=True, tp1_hit=1, tp2_hit=1, opened=now.isoformat()),
+        200 * (1 - 0.13), now, s,
+    )
+    check(evtr["reason"] == "trail" and not evtr.get("partials"), f"after TP1+TP2, 13% off peak trails remainder {evtr}")
+
+    # stop after a partial: remaining still stops at -6.1%
+    evsp = risk_mod.evaluate(
+        pos(entry=100, peak=150, trail_active=True, tp1_hit=1, opened=now.isoformat()),
+        93.9, now, s,
+    )
+    check(evsp["reason"] == "stop" and not evsp.get("partials"), f"stop after partial at -6.1% {evsp}")
+
     sys.exit(1 if FAIL else 0)

@@ -108,40 +108,129 @@ def format_lp(pct: float | None) -> str:
     return f"{pct:.2f}% locked"
 
 
-async def top10_pct(rpc, mint: str, pool: str | None, supply_ui: float | None) -> float | None:
-    if not supply_ui:
+def _ui_amount(raw) -> float:
+    if isinstance(raw, dict):
+        raw = raw.get("uiAmount") or raw.get("uiAmountString") or raw.get("amount")
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def top10_from_accounts(accs: list, mint: str, pool: str | None, supply_ui: float | None) -> float | None:
+    """Sum the 10 largest token-account balances, excluding the pool and bonding curve."""
+    if not supply_ui or not accs:
         return None
     curve = bonding_curve_pda(mint)
-    try:
-        largest = await rpc.get_token_largest(mint)
-    except Exception:
+    exclude = {x for x in (pool, curve) if x}
+    bals: list[float] = []
+    for item in accs:
+        info = parsed_token_info(item) if isinstance(item, dict) and (item.get("account") or item.get("pubkey")) else {}
+        if not info and isinstance(item, dict):
+            # already-flattened {pubkey, owner, uiAmount} rows from tests
+            info = item
+        pubkey = item.get("pubkey") or item.get("address") if isinstance(item, dict) else None
+        owner = info.get("owner")
+        if (owner and owner in exclude) or (pubkey and pubkey in exclude):
+            continue
+        ui = _ui_amount(info.get("tokenAmount") if "tokenAmount" in info else info.get("uiAmount") or info.get("uiAmountString"))
+        if ui <= 0:
+            continue
+        bals.append(ui)
+    if not bals:
         return None
-    exclude_owners = {x for x in (pool, curve) if x}
+    bals.sort(reverse=True)
+    return (sum(bals[:10]) / float(supply_ui)) * 100.0
+
+
+async def top10_from_largest(rpc, mint: str, pool: str | None, supply_ui: float | None) -> float | None:
+    if not supply_ui:
+        return None
+    largest = await rpc.get_token_largest(mint)
+    if not largest:
+        return None
+    curve = bonding_curve_pda(mint)
+    exclude = {x for x in (pool, curve) if x}
     total = 0.0
     counted = 0
     for acc in largest:
         addr = acc.get("address")
-        amt = (acc.get("uiAmount") or acc.get("uiAmountString"))
-        try:
-            ui = float(amt or 0)
-        except (TypeError, ValueError):
-            ui = 0.0
+        ui = _ui_amount(acc.get("uiAmount") or acc.get("uiAmountString") or acc)
         owner = None
-        try:
-            info = await rpc.get_account_info(addr, retries=1)
-            parsed = (((info or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
-            owner = parsed.get("owner")
-        except Exception:
-            owner = None
-        if owner and owner in exclude_owners:
+        if addr:
+            try:
+                info = await rpc.get_account_info(addr, retries=1)
+                parsed = (((info or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+                owner = parsed.get("owner")
+            except Exception:
+                owner = None
+        if (owner and owner in exclude) or (addr and addr in exclude):
             continue
-        if addr in exclude_owners:
+        if ui <= 0:
             continue
         total += ui
         counted += 1
         if counted >= 10:
             break
-    return (total / supply_ui) * 100.0
+    if counted == 0:
+        return None
+    return (total / float(supply_ui)) * 100.0
+
+
+async def top10_with_source(
+    rpc,
+    mint: str,
+    pool: str | None,
+    supply_ui: float | None,
+    accounts: list | None = None,
+    retries: int = 3,
+) -> tuple[float | None, str | None]:
+    """Try getTokenLargestAccounts (with retries), then getProgramAccounts.
+
+    Returns (percent, source). source is 'getTokenLargestAccounts',
+    'getProgramAccounts', or None if both failed.
+    """
+    last_err = None
+    for i in range(max(1, int(retries or 1))):
+        try:
+            t10 = await top10_from_largest(rpc, mint, pool, supply_ui)
+            if t10 is not None:
+                log.info("layer 4 top10=%.2f%% source=getTokenLargestAccounts mint=%s", t10, mint)
+                return t10, "getTokenLargestAccounts"
+            last_err = "empty"
+        except Exception as e:
+            last_err = e
+            log.warning("getTokenLargestAccounts try %s/%s failed: %s", i + 1, retries, e)
+        if i + 1 < retries:
+            import asyncio
+            await asyncio.sleep(2)
+    # Fallback: same GPA used for layer 8
+    accs = accounts
+    if accs is None:
+        try:
+            accs = await rpc.get_program_accounts_for_mint(mint)
+        except Exception as e:
+            log.warning("getProgramAccounts for top10 failed: %s", e)
+            accs = None
+    t10 = top10_from_accounts(accs or [], mint, pool, supply_ui)
+    if t10 is not None:
+        log.info("layer 4 top10=%.2f%% source=getProgramAccounts mint=%s", t10, mint)
+        return t10, "getProgramAccounts"
+    log.warning("layer 4 no data: top 10 (largest=%s, gpa=%s) mint=%s", last_err, "empty" if not accs else "unusable", mint)
+    return None, None
+
+
+async def top10_pct(
+    rpc,
+    mint: str,
+    pool: str | None,
+    supply_ui: float | None,
+    accounts: list | None = None,
+    retries: int = 3,
+) -> float | None:
+    """Scanner/legacy helper. Percent of supply held by the top 10, or None."""
+    t10, _src = await top10_with_source(rpc, mint, pool, supply_ui, accounts=accounts, retries=retries)
+    return t10
 
 
 async def run_audit(
@@ -244,19 +333,30 @@ async def run_audit(
     sold_txt = "sold 0" if (at_mig is None or abs(dev_bal - float(at_mig)) < 1e-6) else "held"
     await emit(_layer(3, True, f"{dev_pct:.1f}% · {sold_txt}", "rpc"))
 
+    # Fetch Token + Token-2022 accounts once; reuse for layer 4 fallback and layer 8
+    gpa_accs = None
+    try:
+        gpa_accs = await rpc.get_program_accounts_for_mint(mint)
+    except Exception as e:
+        log.warning("getProgramAccounts (shared 4/8) failed: %s", e)
+        gpa_accs = None
+
     # Layer 4: top 10
     try:
-        t10 = await top10_pct(rpc, mint, coin.get("pool"), supply_ui)
+        t10, t10_src = await top10_with_source(
+            rpc, mint, coin.get("pool"), supply_ui, accounts=gpa_accs, retries=retries,
+        )
     except Exception:
-        t10 = None
+        t10, t10_src = None, None
     if t10 is None:
-        await emit(_layer(4, False, "no data: top 10", "rpc"))
-        return fail(4, "no data: top 10", "rpc")
+        await emit(_layer(4, False, "no data: top 10", t10_src or "rpc"))
+        return fail(4, "no data: top 10", t10_src or "rpc")
     cap = float(s.get("auditor_max_top10_pct") or s.get("max_top10_pct") or 25)
+    src4 = t10_src or "rpc"
     if t10 >= cap:
-        await emit(_layer(4, False, f"top 10 hold {t10:.1f}%", "rpc"))
-        return fail(4, f"top 10 hold {t10:.1f}%", "rpc")
-    await emit(_layer(4, True, f"{t10:.1f}%", "rpc"))
+        await emit(_layer(4, False, f"top 10 hold {t10:.1f}%", src4))
+        return fail(4, f"top 10 hold {t10:.1f}%", src4)
+    await emit(_layer(4, True, f"{t10:.1f}%", src4))
 
     # Layer 5: LP locked via RugCheck market pubkey == pair/pool
     report = None
@@ -324,12 +424,8 @@ async def run_audit(
         return fail(7, f"{biggest} bundled wallets", "rugcheck")
     await emit(_layer(7, True, "None" if biggest <= 1 else str(biggest), "rugcheck"))
 
-    # Layer 8: delegations on Token AND Token-2022
-    try:
-        accs = await rpc.get_program_accounts_for_mint(mint)
-    except Exception:
-        await emit(_layer(8, False, "no data: delegations", "rpc"))
-        return fail(8, "no data: delegations", "rpc")
+    # Layer 8: delegations on Token AND Token-2022 (reuse the GPA fetched above)
+    accs = gpa_accs
     if accs is None:
         await emit(_layer(8, False, "no data: delegations", "rpc"))
         return fail(8, "no data: delegations", "rpc")

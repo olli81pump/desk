@@ -21,7 +21,7 @@ from db import DB
 from notify import Telegram, paper
 
 
-AGENTS = ("scanner", "auditor", "analyst", "executor", "risk", "telegram", "publisher")
+AGENTS = ("scanner", "auditor", "analyst", "brain", "executor", "risk", "telegram", "publisher")
 
 
 def parse_ts(s: str | None) -> datetime | None:

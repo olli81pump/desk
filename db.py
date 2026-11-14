@@ -93,6 +93,26 @@ CREATE TABLE IF NOT EXISTS positions (
   fees_usd REAL,
   pct REAL,
   link TEXT,
+  night TEXT,
+  original_size_usd REAL,
+  realized_pnl_usd REAL DEFAULT 0,
+  tp1_hit INTEGER DEFAULT 0,
+  tp2_hit INTEGER DEFAULT 0,
+  tp1_price REAL,
+  tp2_price REAL,
+  fees_realized_usd REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS brains (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT,
+  mint TEXT,
+  score REAL,
+  size_usd REAL,
+  stack_pct REAL,
+  cap_hit TEXT,
+  reason TEXT,
+  skipped INTEGER,
+  payload TEXT,
   night TEXT
 );
 CREATE TABLE IF NOT EXISTS activity (
@@ -169,7 +189,43 @@ class DB:
         self._c.row_factory = aiosqlite.Row
         await self._c.executescript(SCHEMA)
         await self._c.commit()
+        await self._migrate()
         return self
+
+    async def _migrate(self) -> None:
+        """Add columns/tables that CREATE TABLE IF NOT EXISTS will not add on an existing db."""
+        await self.c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS brains (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT,
+              mint TEXT,
+              score REAL,
+              size_usd REAL,
+              stack_pct REAL,
+              cap_hit TEXT,
+              reason TEXT,
+              skipped INTEGER,
+              payload TEXT,
+              night TEXT
+            );
+            """
+        )
+        cur = await self.c.execute("PRAGMA table_info(positions)")
+        rows = await cur.fetchall()
+        names = {r["name"] for r in rows}
+        for col, typ in (
+            ("original_size_usd", "REAL"),
+            ("realized_pnl_usd", "REAL DEFAULT 0"),
+            ("tp1_hit", "INTEGER DEFAULT 0"),
+            ("tp2_hit", "INTEGER DEFAULT 0"),
+            ("tp1_price", "REAL"),
+            ("tp2_price", "REAL"),
+            ("fees_realized_usd", "REAL DEFAULT 0"),
+        ):
+            if col not in names:
+                await self.c.execute(f"ALTER TABLE positions ADD COLUMN {col} {typ}")
+        await self.c.commit()
 
     async def close(self) -> None:
         if self._c:
@@ -359,6 +415,29 @@ class DB:
                 json.dumps(payload),
             ),
         )
+
+    async def add_brain(self, payload: dict) -> None:
+        await self.execute(
+            "INSERT INTO brains(ts,mint,score,size_usd,stack_pct,cap_hit,reason,skipped,payload,night) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                payload.get("ts") or _now(),
+                payload.get("mint"),
+                payload.get("score"),
+                payload.get("sizeUsd"),
+                payload.get("stackPct"),
+                payload.get("capHit"),
+                payload.get("reason"),
+                1 if payload.get("skipped") else 0,
+                json.dumps(payload),
+                payload.get("night"),
+            ),
+        )
+
+    async def recent_brains(self, limit: int = 20) -> list:
+        return list(await self.fetchall(
+            "SELECT * FROM brains ORDER BY id DESC LIMIT ?", (limit,)
+        ))
 
     async def add_execution(self, payload: dict) -> None:
         await self.execute(

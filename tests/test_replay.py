@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from links import coin_url
 from agents.scanner import scanner_pass
 from sources import HttpSources
 import settings as S
@@ -104,7 +105,7 @@ async def main() -> int:
             "age_min": round(age, 1),
             "verdict": verdict,
             "reason": reason,
-            "link": f"https://fomo.family/tokens/solana/{mint}?r=olli81",
+            "link": coin_url(mint, "solana"),
         }
         activity.append(rec)
         label = rec["name"] or rec["symbol"] or mint[:8]

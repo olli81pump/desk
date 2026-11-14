@@ -36,10 +36,13 @@ DEFAULTS: dict[str, Any] = {
     "bundled_penalty_at": 3,
     "flush_drop_m5_pct": 5.0,
     "chase_h1_pct": 80.0,
+    # brain
+    "min_size_usd": 5.0,
+    "max_size_usd": 10.0,
     # executor
     "stack_pct": 8.0,
     "max_pool_pct": 2.0,
-    "min_ticket_usd": 47.50,
+    "min_ticket_usd": 5.0,
     "below_min": "bump",
     "recheck_liq_drop_pct": 20.0,
     "recheck_price_up_pct": 15.0,
@@ -52,11 +55,15 @@ DEFAULTS: dict[str, Any] = {
     "timeout_h": 3.0,
     "timeout_min_gain_pct": 5.0,
     "risk_confirm_window_min": 2,
+    "tp1_pct": 50.0,
+    "tp1_fraction": 0.333,
+    "tp2_pct": 100.0,
+    "tp2_fraction": 0.333,
     # desk
     "mode": "PAPER",
-    "paper_start_stack": 200.0,
+    "paper_start_stack": 50.0,
     "live_stack": None,
-    "paper_balance": 200.0,
+    "paper_balance": 50.0,
     "report_time": "08:00",
     "notifier": "telegram",
     "rpc_url": "https://api.mainnet-beta.solana.com",
@@ -93,7 +100,13 @@ RANGES: dict[str, tuple[float | int | None, float | int | None]] = {
     "chase_h1_pct": (1, 10_000),
     "stack_pct": (0.1, 100),
     "max_pool_pct": (0.1, 100),
-    "min_ticket_usd": (5, 10_000),
+    "min_ticket_usd": (1, 10_000),
+    "min_size_usd": (1, 10_000),
+    "max_size_usd": (1, 10_000),
+    "tp1_pct": (1, 10_000),
+    "tp1_fraction": (0.01, 1),
+    "tp2_pct": (1, 10_000),
+    "tp2_fraction": (0.01, 1),
     "recheck_liq_drop_pct": (0, 100),
     "recheck_price_up_pct": (0, 1_000),
     "executor_confirm_window_min": (1, 120),
@@ -175,6 +188,39 @@ ALIASES: dict[str, str] = {
     "paper_start_stack": "paper_start_stack",
     "max_pool_pct": "max_pool_pct",
     "max pool": "max_pool_pct",
+    "min size": "min_size_usd",
+    "min_size": "min_size_usd",
+    "min_size_usd": "min_size_usd",
+    "brain min": "min_size_usd",
+    "max size": "max_size_usd",
+    "max_size": "max_size_usd",
+    "max_size_usd": "max_size_usd",
+    "brain max": "max_size_usd",
+    "tp1": "tp1_pct",
+    "tp1_pct": "tp1_pct",
+    "take profit": "tp1_pct",
+    "take profit 1": "tp1_pct",
+    "tp1 fraction": "tp1_fraction",
+    "tp1_fraction": "tp1_fraction",
+    "tp2": "tp2_pct",
+    "tp2_pct": "tp2_pct",
+    "take profit 2": "tp2_pct",
+    "tp2 fraction": "tp2_fraction",
+    "tp2_fraction": "tp2_fraction",
+}
+
+# Settings groups for the Account tab (read-only)
+GROUPS: dict[str, list[str]] = {
+    "brain": ["min_size_usd", "max_size_usd", "max_pool_pct"],
+    "risk": [
+        "stop_pct", "trail_start_pct", "trail_pct", "timeout_h",
+        "timeout_min_gain_pct", "tp1_pct", "tp1_fraction", "tp2_pct", "tp2_fraction",
+        "risk_poll_s", "risk_confirm_window_min",
+    ],
+    "executor": [
+        "stack_pct", "min_ticket_usd", "below_min",
+        "recheck_liq_drop_pct", "recheck_price_up_pct", "executor_confirm_window_min",
+    ],
 }
 
 
@@ -183,27 +229,25 @@ def fresh() -> dict[str, Any]:
 
 
 def min_stack(s: dict[str, Any]) -> float:
-    pct = float(s["stack_pct"]) / 100.0
-    if pct <= 0:
-        return float("inf")
-    return float(s["min_ticket_usd"]) / pct
+    """Smallest stack that can still fund Brain's minimum ticket.
+
+    Brain sizes $min_size_usd–$max_size_usd and no longer uses stack_pct,
+    so the old min_ticket / stack_pct floor (which warned on a $50 stack)
+    no longer applies.
+    """
+    if s.get("min_size_usd") is not None:
+        return float(s["min_size_usd"])
+    return float(s.get("min_ticket_usd") or 5)
 
 
 def ticket_check(s: dict[str, Any], stack: float | None = None) -> dict[str, Any]:
-    """Run the STEP 10 ticket check. Returns a message for the owner if needed."""
+    """Warn only when the stack cannot fund Brain's minimum size."""
     st = float(stack if stack is not None else (
         s["paper_balance"] if s.get("mode") == "PAPER" else (s.get("live_stack") or s["paper_start_stack"])
     ))
     need = min_stack(s)
-    min_t = float(s["min_ticket_usd"])
-    pct = float(s["stack_pct"])
-    below = s.get("below_min", "bump")
     if st + 1e-9 >= need:
         return {"ok": True, "warning": None, "block": False, "stack": st, "min_stack": need}
-    if below == "bump":
-        effective_pct = (min_t / st) * 100.0 if st else 0.0
-        msg = f"tickets bumped to ${min_t:.2f} = {effective_pct:.2f}% of stack"
-        return {"ok": True, "warning": msg, "block": False, "stack": st, "min_stack": need, "bumped": True}
     msg = f"every coin will be skipped, stack under ${need:.2f}"
     return {"ok": False, "warning": msg, "block": True, "stack": st, "min_stack": need, "bumped": False}
 
@@ -283,4 +327,8 @@ def validate(key: str, value: Any) -> str | None:
 def format_change(key: str, old: Any, new: Any) -> str:
     if key == "stop_pct":
         return f"stop -{old}% -> -{new}%"
+    if key in {"tp1_pct", "tp2_pct"}:
+        return f"{key.replace('_pct','')} {old}% -> {new}%"
+    if key in {"min_size_usd", "max_size_usd", "min_ticket_usd"}:
+        return f"{key} ${old} -> ${new}"
     return f"{key} {old} -> {new}"

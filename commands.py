@@ -69,6 +69,7 @@ def agent_name(raw: str) -> str | None:
         "scanner": "scanner", "1": "scanner",
         "auditor": "auditor", "2": "auditor",
         "analyst": "analyst", "3": "analyst",
+        "brain": "brain",
         "executor": "executor", "4": "executor",
         "risk": "risk", "5": "risk",
     }
@@ -159,7 +160,16 @@ async def cmd_status(desk) -> tuple[str, dict | None]:
     kb_rows = []
     for p in poss:
         name = p["name"] or p["symbol"] or p["mint"]
-        lines.append(f"{name}  entry {p['entry_price']}  size ${p['size_usd']:.2f}  {coin_url(p['mint'], 'solana')}")
+        orig = p["original_size_usd"] if "original_size_usd" in p.keys() and p["original_size_usd"] else p["size_usd"]
+        rem = p["size_usd"]
+        bits = [f"{name}  remaining ${float(rem or 0):.2f} of ${float(orig or 0):.2f}"]
+        if p["tp1_hit"] if "tp1_hit" in p.keys() else False:
+            bits.append("TP1 hit")
+        if p["tp2_hit"] if "tp2_hit" in p.keys() else False:
+            bits.append("TP2 hit")
+        bits.append(f"entry {p['entry_price']}")
+        bits.append(coin_url(p["mint"], "solana"))
+        lines.append("  ".join(bits))
         kb_rows.append([{"text": f"Sell {p['symbol'] or name} on FOMO", "url": coin_url(p["mint"], "solana")}])
     return "\n".join(lines), {"inline_keyboard": kb_rows}
 
@@ -201,7 +211,7 @@ async def cmd_set(desk, arg: str) -> tuple[str, dict | None]:
     # stop loosening must not move open stops down — applied in risk when a position is opened
     desk.settings[key] = val
     await desk.db.save_settings(desk.settings)
-    if key in {"stack_pct", "below_min", "min_ticket_usd", "paper_start_stack"}:
+    if key in {"stack_pct", "below_min", "min_ticket_usd", "min_size_usd", "max_size_usd", "paper_start_stack"}:
         await desk.ticket_announce()
     return S.format_change(key, old, val), None
 
@@ -209,7 +219,7 @@ async def cmd_set(desk, arg: str) -> tuple[str, dict | None]:
 async def cmd_pause(desk, cmd: str, arg: str) -> tuple[str, dict | None]:
     agent = agent_name(arg)
     if not agent:
-        return "Name one of: Scanner, Auditor, Analyst, Executor, Risk.", None
+        return "Name one of: Scanner, Auditor, Analyst, Brain, Executor, Risk.", None
     paused = await desk.db.get_kv("paused", {}) or {}
     if cmd == "pause" and agent == "risk":
         openp = await desk.db.open_positions()
