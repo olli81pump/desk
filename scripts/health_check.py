@@ -47,22 +47,25 @@ async def main() -> int:
     # process itself
     pid_file = ROOT / "logs" / "desk.pid"
     wrap = ROOT / "logs" / "wrapper.pid"
-    alive = False
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, 0)
-            alive = True
-        except Exception:
-            alive = False
+    import subprocess as _sp
+    alive = bool(_sp.run(["pgrep", "-f", str(ROOT / "desk.py")], capture_output=True, text=True).stdout.split())
     if not alive or restarted:
         # If the wrapper is running it will restart the process after we kill it.
-        if pid_file.exists():
+        import subprocess, time
+        pids = [int(x) for x in subprocess.run(["pgrep", "-f", str(ROOT / "desk.py")], capture_output=True, text=True).stdout.split()]
+        for pid in pids:
             try:
-                os.kill(int(pid_file.read_text().strip()), signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
             except Exception:
                 pass
-        if not wrap.exists():
+        time.sleep(10)
+        for pid in pids:  # a hung shutdown must not block the wrapper's restart
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        if not _sp.run(["pgrep", "-f", "run_desk.sh"], capture_output=True, text=True).stdout.split():
             # start the wrapper in the background
             import subprocess
             log = ROOT / "logs"
