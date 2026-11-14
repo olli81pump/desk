@@ -13,3 +13,9 @@ __pycache__/
 logs/
 bin/
 .DS_Store
+docs/d/_screenshot/
+docs/d/*/state.json
+docs/d/_screenshot/
+screens/
+data/
+logs/replay/
