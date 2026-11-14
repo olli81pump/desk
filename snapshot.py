@@ -36,7 +36,35 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
     audits_n = await _count(db, "SELECT COUNT(*) n FROM audits")
     rejected_a = await _count(db, "SELECT COUNT(*) n FROM audits WHERE passed=0")
     analyses_n = await _count(db, "SELECT COUNT(*) n FROM analyses")
+    try:
+        brains_n = await _count(db, "SELECT COUNT(*) n FROM brains")
+    except Exception:
+        brains_n = 0
     trades_n = await _count(db, "SELECT COUNT(*) n FROM positions")
+    brain_feed = []
+    try:
+        brows = await db.recent_brains(20)
+    except Exception:
+        brows = []
+    for row in brows:
+        r = _row(row)
+        name = None
+        if r.get("mint"):
+            crow = await db.coin(r.get("mint"))
+            if crow:
+                name = crow["name"] or crow["symbol"]
+        brain_feed.append({
+            "mint": r.get("mint"),
+            "name": name,
+            "score": r.get("score"),
+            "sizeUsd": r.get("size_usd"),
+            "stackPct": r.get("stack_pct"),
+            "capHit": r.get("cap_hit"),
+            "reason": r.get("reason"),
+            "skipped": bool(r.get("skipped")),
+            "link": coin_url(r.get("mint"), "solana") if r.get("mint") else None,
+            "ts": r.get("ts"),
+        })
     waiting = await db.fetchall("SELECT w.mint, c.name, c.symbol, c.pool, w.added_at FROM waiting w LEFT JOIN coins c ON c.mint=w.mint")
 
     scan_feed = []
@@ -64,6 +92,23 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
         c = _row(row)
         mint = c["mint"]
         coins_out[mint] = await _coin_pack(db, c, s)
+
+    for pos in positions:
+        mint = pos.get("mint")
+        pos["tp1_pct"] = s.get("tp1_pct")
+        pos["tp2_pct"] = s.get("tp2_pct")
+        pos["tp1_fraction"] = s.get("tp1_fraction")
+        pos["tp2_fraction"] = s.get("tp2_fraction")
+        if mint and mint in coins_out:
+            pos["prices"] = coins_out[mint].get("prices") or []
+        pts = pos.get("prices") or []
+        last = next((x.get("price") for x in reversed(pts) if x.get("price")), None)
+        entry = pos.get("entry_price")
+        if last and entry:
+            pct = (float(last) / float(entry) - 1) * 100
+            pos["last_price"] = last
+            pos["pct"] = round(pct, 2)
+            pos["pnl_usd"] = round(float(pos.get("size_usd") or 0) * pct / 100 + float(pos.get("realized_pnl_usd") or 0), 2)
 
     mode = s.get("mode") or "PAPER"
     stack = float(s["paper_balance"] if mode == "PAPER" else (s.get("live_stack") or 0) or 0)
@@ -115,10 +160,19 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
                 "min_score": s.get("min_score"),
                 "last": await _last_analysis(db),
             },
+            "brain": {
+                "name": "Brain",
+                "card": _brain_card(s, brains_n),
+                "sub": f"${s.get('min_size_usd'):g}–${s.get('max_size_usd'):g}",
+                "paused": bool(paused.get("brain")),
+                "heartbeat": hb.get("brain"),
+                "decisions": brain_feed,
+                "last": brain_feed[0] if brain_feed else None,
+            },
             "executor": {
                 "name": "Executor",
                 "card": f"{trades_n} trades",
-                "sub": f"{s.get('stack_pct')}% of stack",
+                "sub": "Brain sizes",
                 "paused": bool(paused.get("executor")),
                 "heartbeat": hb.get("executor"),
             },
@@ -131,6 +185,7 @@ async def build(db, s: dict, extra: dict | None = None) -> dict:
                 "pills": {
                     "stop": f"stop -{s.get('stop_pct')}%",
                     "trail": f"trail {s.get('trail_pct')}%",
+                    "tp": f"TP {s.get('tp1_pct'):g}%/{s.get('tp2_pct'):g}%",
                 },
             },
         },
@@ -160,8 +215,14 @@ def _pos(p: dict) -> dict:
         "entry_price": p.get("entry_price"),
         "peak_price": p.get("peak_price"),
         "size_usd": p.get("size_usd"),
+        "original_size_usd": p.get("original_size_usd") or p.get("size_usd"),
+        "realized_pnl_usd": p.get("realized_pnl_usd") or 0,
         "stop_pct": p.get("stop_pct"),
         "trail_active": bool(p.get("trail_active")),
+        "tp1_hit": bool(p.get("tp1_hit")),
+        "tp2_hit": bool(p.get("tp2_hit")),
+        "tp1_price": p.get("tp1_price"),
+        "tp2_price": p.get("tp2_price"),
         "link": p.get("link") or coin_url(mint, "solana"),
         "pnl_usd": p.get("pnl_usd"),
         "pct": p.get("pct"),
@@ -239,13 +300,19 @@ async def _last_analysis(db):
 
 def _last_exit_label(activity: list[dict]) -> str:
     for a in activity:
-        if a.get("kind") in {"sold", "stopped", "trailed", "timeout", "pulled"}:
+        if a.get("kind") in {"sold", "stopped", "trailed", "timeout", "pulled", "took_profit"}:
             if a.get("kind") == "stopped":
                 return "Stopped"
             if a.get("kind") in {"sold", "trailed"}:
                 return "Trailed out"
+            if a.get("kind") == "took_profit":
+                return "Took profit"
             return a.get("title") or a.get("kind")
     return "No exits yet"
+
+
+def _brain_card(s: dict, n: int) -> str:
+    return f"{n} sized" if n else "Sizing"
 
 
 def _json(v):

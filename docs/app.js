@@ -107,7 +107,7 @@
     return {
       mode: "PAPER", balance: 200, stack: 200, fomo_handle: "olli81",
       signup_url: "https://fomo.family/r/olli81",
-      profile_url: "https://fomo.family/profile/olli81?r=olli81",
+      profile_url: "https://fomo.family/profile/olli81?source=share_link&r=olli81",
       notifier: "telegram",
       notifier_note: "Web-Push ist in Plan B nicht verfügbar. Meldungen kommen über Telegram.",
       settings: { stop_pct: 6, trail_pct: 12, stack_pct: 8, analyst_mode: "rules", mode: "PAPER" },
@@ -158,6 +158,23 @@
       </nav></div>`;
   }
 
+  function fracLabel(f) {
+    const n = Number(f);
+    if (!Number.isFinite(n)) return "";
+    if (Math.abs(n - 1/3) < 0.02 || Math.abs(n - 0.333) < 0.02) return "1/3";
+    if (Math.abs(n - 0.5) < 0.02) return "1/2";
+    if (Math.abs(n - 2/3) < 0.02) return "2/3";
+    return Math.round(n * 100) + "%";
+  }
+
+  function tpMeta(p) {
+    const orig = Number(p.original_size_usd != null ? p.original_size_usd : p.size_usd);
+    const rem = Number(p.size_usd);
+    const tp1 = p.tp1_hit ? "TP1 hit" : "TP1 open";
+    const tp2 = p.tp2_hit ? "TP2 hit" : "TP2 open";
+    return `remaining ${money(rem)} of ${money(orig)} · ${tp1} · ${tp2}`;
+  }
+
   function viewHome() {
     if (!state) return "";
     const pos = state.positions || [];
@@ -168,9 +185,11 @@
         <div class="card pos">
           <div>
             <div class="name">${coinA(p)}</div>
-            <div class="meta">entry ${esc(p.entry_price)} · ${money(p.size_usd)} · stop -${esc(p.stop_pct)}%</div>
+            ${p.pct != null ? `<div style="font-weight:600;color:${p.pct >= 0 ? "#3ddc84" : "#ff5c5c"}">jetzt ${esc(p.last_price)} · ${p.pct >= 0 ? "+" : ""}${Number(p.pct).toFixed(1)}% · ${p.pnl_usd >= 0 ? "+" : "-"}$${Math.abs(Number(p.pnl_usd)).toFixed(2)}</div>` : ""}
+            <div class="meta">entry ${esc(p.entry_price)} · ${tpMeta(p)} · stop -${esc(p.stop_pct)}%</div>
           </div>
           <a class="btn sell" href="${esc(p.link)}" target="_blank" rel="noopener">Sell on FOMO</a>
+          <canvas class="chart mini" data-mint="${esc(p.mint)}" width="358" height="80"></canvas>
         </div>`).join("");
     }
     let feed = `<div class="empty">Noch keine Aktivität.</div>`;
@@ -200,15 +219,25 @@
 
   function viewAgents() {
     const A = (state && state.agents) || {};
-    const cards = ["scanner","auditor","analyst","executor","risk"].map((k) => {
+    const cards = ["scanner","auditor","analyst","brain","executor","risk"].map((k) => {
       const a = A[k] || { name: k };
       const go = k === "auditor" ? "/auditor" : (k === "scanner" ? "/agents" : "/agents");
       const pills = a.pills ? `<div class="pills">
-        <span class="pill stop">${esc(a.pills.stop)}</span>
-        <span class="pill trail">${esc(a.pills.trail)}</span>
+        ${a.pills.stop ? `<span class="pill stop">${esc(a.pills.stop)}</span>` : ""}
+        ${a.pills.trail ? `<span class="pill trail">${esc(a.pills.trail)}</span>` : ""}
+        ${a.pills.tp ? `<span class="pill tp">${esc(a.pills.tp)}</span>` : ""}
       </div>` : "";
       let feed = "";
-      if (a.feed && a.feed.length) {
+      if (k === "brain" && a.decisions && a.decisions.length) {
+        feed = a.decisions.slice(0, 8).map((d) => `
+          <div class="row ${d.skipped?"kill":""}">
+            <div class="title">${coinA(d, d.name || d.symbol || d.mint)}
+              <div class="sub">${d.skipped ? esc(d.reason||"skipped") : ("score " + esc(d.score) + (d.capHit ? " · cap " + esc(d.capHit) : ""))}</div>
+            </div>
+            <div class="right">${d.skipped ? "Skipped" : ("$" + Number(d.sizeUsd).toFixed(2))}</div>
+          </div>`).join("");
+        feed = `<div style="margin-top:8px">${feed}</div>`;
+      } else if (a.feed && a.feed.length) {
         feed = a.feed.slice(0, 8).map((f) => `
           <div class="row ${f.verdict==="kill"?"kill":""}">
             <div class="title">${coinA(f, f.name || f.symbol)}
@@ -274,17 +303,32 @@
         <h1 class="screen">Coin</h1><div class="empty">Diese Münze kenne ich noch nicht.</div>`;
     }
     const pos = c.position;
-    const stop = pos && pos.trail_active;
+    const trailOn = pos && pos.trail_active;
+    const s = (state && state.settings) || {};
+    const tp1pct = Number((pos && pos.tp1_pct) != null ? pos.tp1_pct : s.tp1_pct) || 50;
+    const tp2pct = Number((pos && pos.tp2_pct) != null ? pos.tp2_pct : s.tp2_pct) || 100;
+    const f1 = (pos && pos.tp1_fraction) != null ? pos.tp1_fraction : s.tp1_fraction;
+    const f2 = (pos && pos.tp2_fraction) != null ? pos.tp2_fraction : s.tp2_fraction;
+    const legend = pos ? [
+      trailOn ? `<span><i class="swatch"></i>Risk trailing stop</span>` : "",
+      `<span><i class="swatch tp1"></i>TP1 +${tp1pct}%${pos.tp1_hit ? " · hit" : ""}</span>`,
+      `<span><i class="swatch tp2"></i>TP2 +${tp2pct}%${pos.tp2_hit ? " · hit" : ""}</span>`,
+    ].filter(Boolean).join("") : "";
+    const exitCard = pos ? `<div class="card pos" style="margin-top:12px">
+        <div><div class="name">Open · stop -${esc(pos.stop_pct)}%</div>
+        <div class="meta">entry ${esc(pos.entry_price)} · ${tpMeta(pos)}</div>
+        <div class="tp-lines">
+          <div class="tp-line ${pos.tp1_hit ? "hit" : ""}">TP1 +${tp1pct}% · ${fracLabel(f1)} · ${pos.tp1_hit ? "hit" : "open"}</div>
+          <div class="tp-line ${pos.tp2_hit ? "hit" : ""}">TP2 +${tp2pct}% · ${fracLabel(f2)} · ${pos.tp2_hit ? "hit" : "open"}</div>
+        </div></div>
+        <a class="btn sell" href="${esc(pos.link)}" target="_blank" rel="noopener">Sell on FOMO</a>
+      </div>` : "";
     return `<button class="back" data-go="/home">← Home</button>
       <h1 class="screen">${esc(c.name || c.symbol || mint)}</h1>
       <div class="muted" style="margin-bottom:10px">${coinA(c, c.symbol || mint)} · ${esc(mint)}</div>
       <canvas class="chart" id="chart" width="358" height="160"></canvas>
-      <div class="legend">${stop || (pos) ? `<span><i class="swatch"></i>Risk trailing stop</span>` : ""}</div>
-      ${pos ? `<div class="card pos" style="margin-top:12px">
-        <div><div class="name">Open · stop -${esc(pos.stop_pct)}%</div>
-        <div class="meta">entry ${esc(pos.entry_price)} · ${money(pos.size_usd)}</div></div>
-        <a class="btn sell" href="${esc(pos.link)}" target="_blank" rel="noopener">Sell on FOMO</a>
-      </div>` : ""}
+      <div class="legend">${legend}</div>
+      ${exitCard}
       <div class="section"><h2>Auditor</h2></div>
       ${c.audit && c.audit.layers ? `<div class="layers">${c.audit.layers.map((L)=>{
         const cls = L.pass===true?"ok":(L.pass===false?"red":"grey");
@@ -294,8 +338,19 @@
 
   function viewAccount() {
     const s = (state && state.settings) || {};
-    const keys = Object.keys(s).sort();
-    const rows = keys.map((k) => `<div class="setting"><div class="k">${esc(k)}</div><div class="v">${esc(s[k])}</div></div>`).join("");
+    const groups = [
+      { id: "brain", title: "Brain", keys: ["min_size_usd", "max_size_usd", "max_pool_pct"] },
+      { id: "risk", title: "Risk", keys: ["stop_pct", "trail_start_pct", "trail_pct", "timeout_h", "timeout_min_gain_pct", "tp1_pct", "tp1_fraction", "tp2_pct", "tp2_fraction"] },
+      { id: "executor", title: "Executor", keys: ["min_ticket_usd", "stack_pct", "below_min", "recheck_liq_drop_pct", "recheck_price_up_pct"] },
+    ];
+    const used = new Set(groups.flatMap((g) => g.keys));
+    const rest = Object.keys(s).filter((k) => !used.has(k)).sort();
+    const row = (k) => `<div class="setting"><div class="k">${esc(k)}</div><div class="v">${esc(s[k])}</div></div>`;
+    const blocks = groups.map((g) => {
+      const rows = g.keys.filter((k) => k in s).map(row).join("");
+      return `<div class="section"><h2>${esc(g.title)}</h2></div><div class="card settings-group" data-group="${esc(g.id)}">${rows}</div>`;
+    }).join("");
+    const more = rest.length ? `<div class="section"><h2>More</h2></div><div class="card">${rest.map(row).join("")}</div>` : "";
     return `<h1 class="screen">Account</h1>
       <div class="card">
         <div class="kicker">Notifier</div>
@@ -305,8 +360,7 @@
         <div style="margin-top:6px">${state && state.signup_url ? `<a href="${esc(state.signup_url)}" target="_blank" rel="noopener">${esc(state.signup_url)}</a>` : ""}</div>
         <div class="muted" style="margin-top:8px">Einstellungen sind hier nur lesbar. Ändern geht per Telegram, z. B. set stop to -8%.</div>
       </div>
-      <div class="section"><h2>Settings</h2></div>
-      <div class="card">${rows || `<div class="empty">Keine Settings geladen.</div>`}</div>`;
+      ${blocks}${more}`;
   }
 
   function drawChart() {
@@ -318,36 +372,70 @@
     const w = cnv.width, h = cnv.height;
     ctx.clearRect(0, 0, w, h);
     const pts = (c && c.prices) || [];
-    if (pts.length < 2) {
+    const pos = c && c.position;
+    drawPriceChart(ctx, w, h, pts, pos, state && state.settings);
+  }
+
+  function drawPriceChart(ctx, w, h, pts, pos, settings) {
+    const prices = pts.map((p) => Number(p.price)).filter(Number.isFinite);
+    if (prices.length < 2) {
       ctx.fillStyle = "#5c6478";
       ctx.fillText("Noch keine Kerzen.", 16, h/2);
       return;
     }
-    const prices = pts.map((p) => Number(p.price)).filter(Number.isFinite);
     let lo = Math.min(...prices), hi = Math.max(...prices);
-    if (lo === hi) { lo *= 0.99; hi *= 1.01; }
-    const pos = c.position;
     const entry = pos && Number(pos.entry_price);
     const stopPct = pos && Number(pos.stop_pct);
+    const st = settings || {};
     const trail = pos && pos.trail_active && pos.peak_price != null
-      ? Number(pos.peak_price) * (1 - (Number(state.settings && state.settings.trail_pct) || 12) / 100)
+      ? Number(pos.peak_price) * (1 - (Number(st.trail_pct) || 12) / 100)
       : (entry && stopPct != null ? entry * (1 - stopPct / 100) : null);
-    const xs = (i) => 8 + (i / (pts.length - 1)) * (w - 16);
+    const tp1pct = Number((pos && pos.tp1_pct) != null ? pos.tp1_pct : st.tp1_pct) || 50;
+    const tp2pct = Number((pos && pos.tp2_pct) != null ? pos.tp2_pct : st.tp2_pct) || 100;
+    const tp1 = entry ? entry * (1 + tp1pct / 100) : null;
+    const tp2 = entry ? entry * (1 + tp2pct / 100) : null;
+    [trail, tp1, tp2, entry].forEach((v) => {
+      if (v != null && Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    });
+    if (lo === hi) { lo *= 0.99; hi *= 1.01; }
+    const xs = (i) => 8 + (i / (Math.max(pts.length, 2) - 1)) * (w - 16);
     const ys = (p) => 10 + (1 - (p - lo) / (hi - lo)) * (h - 20);
+    const dash = (color, y) => {
+      if (y == null || !Number.isFinite(y)) return;
+      ctx.strokeStyle = color;
+      ctx.setLineDash([5, 4]);
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(8, ys(y));
+      ctx.lineTo(w - 8, ys(y));
+      ctx.stroke();
+      ctx.setLineDash([]);
+    };
     ctx.strokeStyle = "#3ee0d4";
     ctx.lineWidth = 1.6;
     ctx.beginPath();
     prices.forEach((p, i) => { const x = xs(i), y = ys(p); i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); });
     ctx.stroke();
-    if (trail != null && Number.isFinite(trail)) {
-      ctx.strokeStyle = "#ff9f43";
-      ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      ctx.moveTo(8, ys(trail));
-      ctx.lineTo(w - 8, ys(trail));
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
+    dash("#ff9f43", trail);
+    dash("#7cf0a8", tp1);
+    dash("#3ee08a", tp2);
+  }
+
+  function drawHomeCharts() {
+    if (!state) return;
+    document.querySelectorAll("canvas.chart.mini").forEach((cnv) => {
+      const mint = cnv.getAttribute("data-mint");
+      const pos = (state.positions || []).find((p) => p.mint === mint);
+      const ctx = cnv.getContext("2d");
+      ctx.clearRect(0, 0, cnv.width, cnv.height);
+      const pts = (pos && pos.prices) || [];
+      if (pts.length < 2) {
+        ctx.fillStyle = "#5c6478";
+        ctx.fillText("TP marks once price prints.", 12, cnv.height/2);
+        return;
+      }
+      drawPriceChart(ctx, cnv.width, cnv.height, pts, pos, state.settings);
+    });
   }
 
   function render() {
@@ -367,6 +455,7 @@
     root.innerHTML = shell(inner, tab);
     bind(root);
     if (route === "coin") requestAnimationFrame(drawChart);
+    if (route === "home" || !route) requestAnimationFrame(drawHomeCharts);
   }
 
   function bind(root) {
