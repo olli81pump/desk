@@ -1,0 +1,1353 @@
+(function () {
+  "use strict";
+  const LS_KEY = "desk_data_path";
+  const LS_STAT = "desk_stat_mode";
+  const POLL_MS = 60 * 1000;
+  const TZ = "Europe/Berlin";
+
+  /* ------------------------------------------------------------ routing */
+  function parseHash() {
+    const raw = (location.hash || "").replace(/^#/, "");
+    const out = { data: null, route: "terminal", mint: null };
+    const parts = raw.split("&").filter(Boolean);
+    // support #d=PATH, #d=PATH&/coin/MINT, #/account, #/auditor/MINT
+    for (const p of parts) {
+      if (p.startsWith("d=")) out.data = decodeURIComponent(p.slice(2));
+      else if (p.startsWith("/")) Object.assign(out, routeOf(p));
+      else if (p.startsWith("d/")) out.data = decodeURIComponent(p.slice(2));
+    }
+    if (!out.data && raw.startsWith("d=")) {
+      const rest = raw.slice(2);
+      const cut = rest.search(/[&/]/);
+      out.data = decodeURIComponent(cut === -1 ? rest : rest.slice(0, cut));
+      const after = cut === -1 ? "" : rest.slice(cut).replace(/^&/, "");
+      if (after.startsWith("/")) Object.assign(out, routeOf(after));
+    } else if (raw.startsWith("/")) {
+      Object.assign(out, routeOf(raw.split("&")[0]));
+    }
+    return out;
+  }
+  function routeOf(path) {
+    const s = path.replace(/^\//, "").split("/").filter(Boolean);
+    if (!s.length) return { route: "terminal" };
+    if (s[0] === "home" || s[0] === "desk") return { route: "home" };
+    if (s[0] === "terminal") return { route: "terminal" };
+    if (s[0] === "activity") return { route: "activity" };
+    if (s[0] === "agents") return { route: "agents" };
+    if (s[0] === "stats") return { route: "stats" };
+    if (s[0] === "radar") return { route: "radar" };
+    if (s[0] === "account") return { route: "account" };
+    if (s[0] === "auditor") return { route: "auditor", mint: s[1] || null };
+    if (s[0] === "coin" && s[1]) return { route: "coin", mint: s[1] };
+    return { route: "terminal" };
+  }
+  function go(path) {
+    const d = localStorage.getItem(LS_KEY);
+    const prefix = d ? `#d=${encodeURIComponent(d)}&` : "#";
+    location.hash = prefix + path;
+  }
+
+  let state = null;
+  let error = null;
+  let statMode = localStorage.getItem(LS_STAT) || "ALL";
+  let tapeAll = false;
+
+  function dataPath() {
+    const fromHash = parseHash().data || new URLSearchParams(location.search).get("d");
+    if (fromHash) {
+      localStorage.setItem(LS_KEY, fromHash);
+      return fromHash;
+    }
+    return localStorage.getItem(LS_KEY);
+  }
+
+  function showPathPrompt() {
+    const root = document.getElementById("app") || document.body;
+    root.innerHTML = `<div class="gate">
+      <div class="logo big">olli81</div>
+      <h1>Zugang einrichten</h1>
+      <p>Füge den Zugangscode aus dem Grok-Bot-Chat ein. Das ist nur einmal nötig.</p>
+      <input id="dpIn" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Zugangscode">
+      <button id="dpBtn">SPEICHERN</button>
+    </div>`;
+    document.getElementById("dpBtn").onclick = () => {
+      let v = (document.getElementById("dpIn").value || "").trim();
+      const m = v.match(/[#&?]d=([^&]+)/); if (m) v = decodeURIComponent(m[1]);
+      if (v.length < 20) return;
+      localStorage.setItem(LS_KEY, v);
+      location.reload();
+    };
+  }
+
+  async function load() {
+    const q = new URLSearchParams(location.search);
+    if (q.get("fixture") === "empty") { state = emptyState(); error = null; render(); return; }
+    if (q.get("fixture") === "error") { state = null; error = "state.json konnte nicht geladen werden."; render(); return; }
+    const dp = dataPath();
+    if (!dp) { state = null; error = null; showPathPrompt(); return; }
+    const url = `d/${encodeURIComponent(dp)}/state.json?ts=${Date.now()}`;
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      state = await r.json();
+      error = null;
+    } catch (e) {
+      error = "state.json konnte nicht geladen werden.";
+    }
+    render();
+  }
+
+  function emptyState() {
+    return {
+      mode: "PAPER", balance: 50, stack: 50, fomo_handle: "olli81", ts: new Date().toISOString(),
+      balances: { PAPER: 50, LIVE: null },
+      signup_url: "https://fomo.family/r/olli81",
+      profile_url: "https://fomo.family/profile/olli81?source=share_link&r=olli81",
+      notifier: "telegram",
+      notifier_note: "Web-Push ist in Plan B nicht verfügbar. Meldungen kommen über Telegram.",
+      settings: { stop_pct: 6, trail_pct: 12, analyst_mode: "rules", mode: "PAPER" },
+      positions: [], activity: [], waiting: [], coins: {}, heartbeats: {},
+      stats: null,
+      agents: {
+        scanner: { name: "Scanner", card: "0 Pools", sub: "0 ok · 0 raus", feed: [] },
+        auditor: { name: "Auditor", card: "0 geprüft", sub: "bereit", latest: null },
+        analyst: { name: "Analyst", card: "Bewertet", sub: "Regeln · 0 bewertet", min_score: 70, last: null },
+        brain: { name: "Brain", card: "Bereit", sub: "$5–$10", decisions: [] },
+        executor: { name: "Executor", card: "0 Trades", sub: "Größe vom Brain" },
+        risk: { name: "Risk", card: "Bereit", sub: "Noch keine Exits", pills: { stop: "Stop −6%", trail: "Trail 12%" } }
+      }
+    };
+  }
+
+  /* ------------------------------------------------------------ format */
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  const nf2 = new Intl.NumberFormat("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  function num(x) { const n = Number(x); return x == null || x === "" || !Number.isFinite(n) ? null : n; }
+  function money(x) { const n = num(x); return n == null ? "—" : (n < 0 ? "−" : "") + nf2.format(Math.abs(n)) + " $"; }
+  function smoney(x) { const n = num(x); return n == null ? "—" : (n > 0 ? "+" : n < 0 ? "−" : "±") + nf2.format(Math.abs(n)) + " $"; }
+  function spct(x, d) { const n = num(x); return n == null ? "—" : (n > 0 ? "+" : n < 0 ? "−" : "±") + Math.abs(n).toLocaleString("de-DE", { minimumFractionDigits: d == null ? 1 : d, maximumFractionDigits: d == null ? 1 : d }) + "%"; }
+  function price(x) {
+    const n = num(x); if (n == null) return "—";
+    if (n === 0) return "0";
+    const a = Math.abs(n);
+    const dig = a >= 1 ? 4 : Math.min(10, Math.max(2, 3 - Math.floor(Math.log10(a))));
+    return n.toLocaleString("de-DE", { minimumFractionDigits: dig, maximumFractionDigits: dig });
+  }
+  function cls(x) { const n = num(x); return n == null || n === 0 ? "" : (n > 0 ? "pos-c" : "neg-c"); }
+  function toDate(s) { if (!s) return null; const d = new Date(s); return isNaN(d) ? null : d; }
+  function hhmm(s, sec) {
+    const d = toDate(s); if (!d) return "—";
+    return d.toLocaleTimeString("de-DE", { timeZone: TZ, hour: "2-digit", minute: "2-digit", second: sec ? "2-digit" : undefined });
+  }
+  function ddmm(s) {
+    const d = toDate(s.length === 10 ? s + "T12:00:00Z" : s); if (!d) return "—";
+    return d.toLocaleDateString("de-DE", { timeZone: TZ, day: "2-digit", month: "2-digit" });
+  }
+  function ageSec(s) { const d = toDate(s); return d ? Math.max(0, (Date.now() - d.getTime()) / 1000) : null; }
+  function ageTxt(sec) {
+    if (sec == null) return "—";
+    if (sec < 60) return Math.round(sec) + "s";
+    if (sec < 3600) return Math.floor(sec / 60) + "m";
+    if (sec < 86400) return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+    return Math.floor(sec / 86400) + "d";
+  }
+  function dur(min) { const m = num(min); if (m == null) return "—"; return m < 60 ? Math.round(m) + " min" : (m / 60).toLocaleString("de-DE", { maximumFractionDigits: 1 }) + " h"; }
+  function dotCls(sec, ok, warn) { return sec == null ? "" : sec < ok ? "ok" : sec < warn ? "warn" : "bad"; }
+  function link(href, text, extra) {
+    if (!href) return esc(text);
+    return `<a href="${esc(href)}" target="_blank" rel="noopener"${extra || ""}>${esc(text)}</a>`;
+  }
+  function coinA(c, label) {
+    const href = (c && (c.link || c.coin_url)) || (typeof c === "string" ? c : null);
+    const text = label || (c && (c.name || c.symbol || c.mint)) || "Coin";
+    return link(href, text);
+  }
+
+  const AGENTS = [
+    ["scanner", "Scanner", "◎"], ["auditor", "Auditor", "⛨"], ["analyst", "Analyst", "◈"],
+    ["brain", "Brain", "◆"], ["executor", "Executor", "⇄"], ["risk", "Risk", "⚑"],
+  ];
+  const SYS = [["telegram", "Telegram"], ["publisher", "Publisher"]];
+  const EXIT_DE = { stop: "Stop", tp1: "TP1 (Teilgewinn)", tp2: "TP2 (Teilgewinn)", trail: "Trailing-Stop", timeout: "Timeout", manual: "Manuell", pulled: "Liquidität weg", dev_dump: "Dev verkauft", no_price: "Kein Preis", lock_time: "Nacht vorbei" };
+  const EXIT_COL = { stop: "r", tp1: "g", tp2: "g", trail: "o", timeout: "a", manual: "b", pulled: "r", dev_dump: "r", no_price: "a", lock_time: "b" };
+  const LAYER_DE = { 1: "Mint-Authority", 2: "Freeze-Authority", 3: "Dev-Wallet", 4: "Top-10-Holder", 5: "Liquidität gesperrt", 6: "Pool-Alter", 7: "Gebündelte Wallets", 8: "Delegationen" };
+
+  function hbAge(agent) {
+    const hb = (state && state.heartbeats) || {};
+    const ts = toDate(state && state.ts);
+    const a = toDate(hb[agent]);
+    if (!a) return null;
+    // age relative to the snapshot time + how old the snapshot is
+    const rel = ts ? Math.max(0, (ts - a) / 1000) : 0;
+    return rel + (ageSec(state.ts) || 0);
+  }
+
+  /* ------------------------------------------------------------ derived */
+  function modeStats(m) {
+    const st = state && state.stats && state.stats.modes;
+    return st ? st[m] || null : null;
+  }
+  function openPnl(mode) {
+    return (state.positions || []).filter((p) => !mode || (p.mode || "PAPER") === mode)
+      .reduce((a, p) => a + (num(p.pnl_usd) || 0) - (num(p.realized_pnl_usd) || 0), 0);
+  }
+  function realizedOpen(mode) {
+    return (state.positions || []).filter((p) => !mode || (p.mode || "PAPER") === mode)
+      .reduce((a, p) => a + (num(p.realized_pnl_usd) || 0), 0);
+  }
+  function todayPnl(mode) {
+    const s = modeStats(mode);
+    return (s ? num(s.today_pnl) || 0 : 0) + openPnl(mode) + realizedOpen(mode);
+  }
+
+  /* ------------------------------------------------------------ shell */
+  const ICONS = {
+    terminal: '<svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z"/></svg>',
+    home: '<svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 4 8-9"/><path d="M3 21h18"/></svg>',
+    radar: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12l6-6"/></svg>',
+    stats: '<svg viewBox="0 0 24 24"><path d="M5 20V11M12 20V4M19 20v-6"/></svg>',
+    agents: '<svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>',
+    account: '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg>',
+  };
+
+  function serverState() {
+    if (!state) return ["", "—"];
+    const a = ageSec(state.ts);
+    if (a == null) return ["", "—"];
+    if (a < 180) return ["ok", "Server online"];
+    if (a < 600) return ["warn", "Server verzögert"];
+    return ["bad", "Server offline?"];
+  }
+  function statusBar() {
+    const mode = (state && state.mode) || "PAPER";
+    const age = state ? ageSec(state.ts) : null;
+    const [sc, stxt] = serverState();
+    let tick = "";
+    if (state) {
+      const tp = todayPnl(mode);
+      const open = (state.positions || []).length;
+      const dots = AGENTS.map(([k, n]) => `<i class="dot ${dotCls(hbAge(k), 180, 900)}" title="${esc(n)}"></i>`).join("");
+      tick = `<div class="tick">
+        <div><div class="lbl">${mode === "LIVE" ? "Live-Stack" : "Paper-Stack"}</div><div class="v">${money(state.stack)}</div></div>
+        <div><div class="lbl">PnL heute</div><div class="v ${cls(tp)}">${smoney(tp)}</div></div>
+        <div><div class="lbl">Offen</div><div class="v">${open}</div></div>
+        <div><div class="lbl">Agenten</div><div class="hb">${dots}</div></div>
+      </div>`;
+    }
+    return `<header class="sbar">
+      <div class="r1">
+        <span class="logo">olli81</span>
+        <span class="mode ${esc(mode)}">${esc(mode)}</span>
+        <span class="spill ${sc}" id="srvPill"><i class="dot ${sc}"></i><span id="srvTxt">${esc(stxt)}</span></span>
+        <span class="upd"><i class="dot ${dotCls(age, 150, 600)}" id="updDot"></i><span id="updTxt">${state ? hhmm(state.ts, true) + " · vor " + ageTxt(age) : "—"}</span></span>
+      </div>${tick}
+    </header>`;
+  }
+
+  function tabBar(tab) {
+    const t = (id, label) => `<button data-go="/${id}" class="${tab === id ? "on" : ""}">${ICONS[id]}${label}</button>`;
+    return `<div class="tabs"><nav>${t("terminal", "Home")}${t("home", "Strategie")}${t("radar", "Radar")}${t("stats", "Statistik")}${t("agents", "Agenten")}${t("account", "Konto")}</nav></div>`;
+  }
+  function shell(inner, tab) {
+    document.body.classList.remove("term");
+    return `${statusBar()}
+      <div class="pad">${inner}</div>
+      ${tabBar(tab)}`;
+  }
+  function termShell(inner) {
+    document.body.classList.add("term");
+    return `<div class="tpad">${inner}</div>${tabBar("terminal")}`;
+  }
+
+  /* ------------------------------------------------------------ home */
+  function posCard(p) {
+    const st = state.settings || {};
+    const pct = num(p.pct), pnl = num(p.pnl_usd);
+    const entry = num(p.entry_price);
+    const stopLine = p.trail_active && num(p.peak_price) != null
+      ? num(p.peak_price) * (1 - (num(st.trail_pct) || 12) / 100)
+      : (entry != null && num(p.stop_pct) != null ? entry * (1 - num(p.stop_pct) / 100) : null);
+    const held = ageSec(p.opened_at);
+    const tp1 = num(p.tp1_pct) != null ? p.tp1_pct : st.tp1_pct;
+    const tp2 = num(p.tp2_pct) != null ? p.tp2_pct : st.tp2_pct;
+    const dir = pct == null ? "" : pct >= 0 ? "up" : "down";
+    return `<div class="posc ${dir}">
+      <div class="ph">
+        <div><div class="nm">${coinA(p)}<span class="tag ${esc(p.mode || "PAPER")}">${esc(p.mode || "PAPER")}</span></div>
+          <div class="lbl" style="margin-top:2px">${esc(p.symbol || "")} · seit ${ageTxt(held)}</div></div>
+        <div class="pnl">${pct != null
+          ? `<div class="a ${cls(pnl)}">${smoney(pnl)}</div><div class="b ${cls(pct)}">${spct(pct)}</div>`
+          : `<div class="b mut">kein Kurs</div>`}</div>
+      </div>
+      <div class="grid4">
+        <div><div class="lbl">Einstieg</div><div class="v">${price(p.entry_price)}</div></div>
+        <div><div class="lbl">Jetzt</div><div class="v ${cls(pct)}">${price(p.last_price)}</div></div>
+        <div><div class="lbl">Hoch</div><div class="v">${price(p.peak_price)}</div></div>
+        <div><div class="lbl">${p.trail_active ? "Trail" : "Stop"}</div><div class="v" style="color:var(--orange)">${price(stopLine)}</div></div>
+        <div><div class="lbl">Größe</div><div class="v">${money(p.size_usd)}</div></div>
+        <div><div class="lbl">Start</div><div class="v">${money(p.original_size_usd)}</div></div>
+        <div><div class="lbl">Realisiert</div><div class="v ${cls(p.realized_pnl_usd)}">${smoney(p.realized_pnl_usd)}</div></div>
+        <div><div class="lbl">Stop</div><div class="v">−${esc(p.stop_pct)}%</div></div>
+      </div>
+      <div class="tpbar">
+        <span class="stop">${p.trail_active ? "TRAIL AKTIV" : "STOP −" + esc(p.stop_pct) + "%"}</span>
+        ${st.exit_mode === "article"
+          ? `<span class="${p.tp1_hit ? "hit" : ""}">TP ${esc(st.tp_x)}x · ${esc(st.tp_sell_pct)}% ${p.tp1_hit ? "✓" : "○"}</span><span>Trail ${esc(st.trail_pct)}%</span>`
+          : `<span class="${p.tp1_hit ? "hit" : ""}">TP1 +${esc(tp1)}% ${p.tp1_hit ? "✓" : "○"}</span>
+        <span class="${p.tp2_hit ? "hit" : ""}">TP2 +${esc(tp2)}% ${p.tp2_hit ? "✓" : "○"}</span>`}
+      </div>
+      <canvas class="mini" data-mint="${esc(p.mint)}"></canvas>
+      <div class="acts">
+        <a class="btn sell" href="${esc(p.link)}" target="_blank" rel="noopener">AUF FOMO VERKAUFEN ↗</a>
+        <button class="btn ghost" data-go="/coin/${esc(p.mint)}">CHART</button>
+      </div>
+    </div>`;
+  }
+
+  const KIND = {
+    bought: ["KAUF", "buy"], sold: ["VERKAUF", ""], stopped: ["STOP", "bad"], took_profit: ["TP", "good"],
+    timeout: ["TIMEOUT", ""], pulled: ["GEZOGEN", "bad"], kill: ["RAUS", "kill"], passed: ["SCAN OK", "good"],
+    audited: ["AUDIT", "good"], rejected: ["ABGEL.", "bad"], scored: ["SCORE", ""], sized: ["GRÖSSE", ""],
+    skipped: ["SKIP", "kill"], signal: ["SIGNAL", "buy"], waiting: ["WARTET", ""],
+  };
+  function tapeRow(a) {
+    const k = KIND[a.kind] || [String(a.kind || "").toUpperCase().slice(0, 8), ""];
+    let tone = k[1];
+    if (a.kind === "sold" || a.kind === "timeout") tone = a.tone === "bad" ? "bad" : "good";
+    const name = String(a.title || "").replace(/^(Bought|Sold|Stopped|Took profit|Rejected|Skipped|Sized|Scored|Audited|Passed)\s+/, "");
+    const right = String(a.right || "");
+    const rc = /^\+/.test(right) ? "pos-c" : /^-/.test(right) ? "neg-c" : "mut";
+    return `<div class="tr ${a.kind === "kill" ? "kill" : ""}">
+      <div class="t">${hhmm(a.ts)}</div>
+      <div class="k ${tone}">${esc(k[0])}</div>
+      <div class="m"><div class="n">${a.link ? coinA({ link: a.link }, name) : esc(name)}</div>
+        <div class="d">${esc(a.agent || "")}${a.detail ? " · " + esc(a.detail) : ""}</div></div>
+      <div class="r ${rc}">${esc(right.replace(/ · [\d.]+% of stack/, ""))}</div>
+    </div>`;
+  }
+
+  function viewHome() {
+    if (!state) return "";
+    const mode = state.mode || "PAPER";
+    const pos = state.positions || [];
+    const act = state.activity || [];
+    const bal = state.balances || {};
+    const ms = modeStats(mode) || {};
+    const other = mode === "LIVE" ? "PAPER" : "LIVE";
+    const unreal = openPnl(null);
+    const kpis = `<div class="kpis">
+      <div class="kpi"><div class="lbl">${mode === "LIVE" ? "Live-Stack" : "Paper-Stack"}</div><div class="v big">${money(state.stack)}</div>
+        <div class="s">${ms.start_stack != null ? "Start " + money(ms.start_stack) : esc(state.fomo_handle || "olli81")}</div></div>
+      <div class="kpi"><div class="lbl">${other === "LIVE" ? "Live-Stack" : "Paper-Stack"}</div><div class="v big mut">${money(bal[other])}</div>
+        <div class="s">nur Info</div></div>
+      <div class="kpi"><div class="lbl">Unrealisiert</div><div class="v big ${cls(unreal)}">${smoney(unreal)}</div>
+        <div class="s">${pos.length} offen</div></div>
+      <div class="kpi"><div class="lbl">PnL gesamt ${esc(mode)}</div><div class="v ${cls(ms.pnl)}">${smoney(ms.pnl || 0)}</div>
+        <div class="s">nach Gebühren</div></div>
+      <div class="kpi"><div class="lbl">Win-Rate</div><div class="v">${ms.win_rate != null ? esc(String(ms.win_rate).replace(".", ",")) + "%" : "—"}</div>
+        <div class="s">${ms.trades || 0} Trades · ${ms.wins || 0}/${ms.losses || 0}</div></div>
+      <div class="kpi"><div class="lbl">Risk</div><div class="v">−${esc((state.settings || {}).stop_pct)}%</div>
+        <div class="s">${(state.settings || {}).exit_mode === "article"
+          ? "TP " + esc((state.settings || {}).tp_x) + "x → " + esc((state.settings || {}).tp_sell_pct) + "% · Trail " + esc((state.settings || {}).trail_pct) + "%"
+          : "TP +" + esc((state.settings || {}).tp1_pct) + "/+" + esc((state.settings || {}).tp2_pct) + "%"}</div></div>
+    </div>`;
+    const positions = pos.length ? pos.map(posCard).join("")
+      : `<div class="empty">Keine offenen Positionen · Scanner sucht weiter</div>`;
+    const shown = tapeAll ? act.slice(0, 120) : act.slice(0, 15);
+    const feed = act.length ? `<div class="tape">${shown.map(tapeRow).join("")}
+      ${act.length > 15 ? `<button class="more" id="tapeMore">${tapeAll ? "WENIGER ZEIGEN" : "ALLE " + Math.min(act.length, 120) + " ZEIGEN"}</button>` : ""}</div>`
+      : `<div class="empty">Noch keine Aktivität.</div>`;
+    return `
+      <div class="sec"><h2>Übersicht</h2><span class="aside">olli81 · Signal-Desk</span></div>
+      ${kpis}
+      ${state.ticket_warning ? `<div class="note warnbox">${esc(state.ticket_warning)}</div>` : ""}
+      ${mode === "LIVE" ? `<div class="note warnbox">LIVE: Der Desk kauft nicht selbst. Signale kommen per Telegram, du tippst in FOMO auf Buy/Sell.</div>` : ""}
+      ${homeFavs()}
+      <div class="sec"><h2>Positionen</h2><span class="aside">${pos.length} offen</span></div>
+      ${positions}
+      ${copyStrategieBlock()}
+      ${signalsBlock(6)}
+      <div class="sec"><h2>Aktivität</h2><span class="aside">Zeiten in Berlin</span></div>
+      ${feed}`;
+  }
+
+
+  /* ------------------------------------------------------------ radar */
+  const HYPE_DE = { hype: ["HYPE", "hy"], neutral: ["NEUTRAL", "ne"], shill: ["SHILL", "sh"] };
+  function R() { return (state && state.radar && !state.radar.error) ? state.radar : null; }
+  function pctBar(p, tone, label) {
+    const v = Math.max(0, Math.min(100, num(p) || 0));
+    const c = tone || (v >= 80 ? "g" : v >= 50 ? "a" : v >= 25 ? "o" : "d");
+    return `<div class="pbar"><div class="trk"><div class="fil ${c}" style="width:${v}%"></div></div><span class="pv">${label != null ? label : Math.round(v) + " %"}</span></div>`;
+  }
+  function segBar(c) {
+    const segs = (c.steps || []).map((s) => `<div class="sg" style="flex:${s.w}" title="${esc(s.label)}: ${esc(s.detail)}"><div class="sf ${s.pct >= 100 ? "g" : s.pct > 0 ? "a" : ""}" style="width:${s.pct}%"></div></div>`).join("");
+    return `<div class="segbar"><div class="sgs">${segs}</div><span class="pv">${Math.round(c.progress)} %</span></div>`;
+  }
+  function links2(c) {
+    return `<div class="lnk2"><a class="btn buy sm" href="${esc(c.link)}" target="_blank" rel="noopener">FOMO ↗</a><a class="btn ghost sm" href="${esc(c.dex)}" target="_blank" rel="noopener">Dexscreener ↗</a></div>`;
+  }
+  function hypePill(h) {
+    if (!h) return "";
+    const d = HYPE_DE[h.label] || [String(h.label).toUpperCase(), "ne"];
+    return `<span class="hp ${d[1]}">${h.label === "hype" ? "🔥 " : h.label === "shill" ? "⚠ " : ""}${d[0]} ${esc(h.score)}%</span>`;
+  }
+  function favCard(c, i) {
+    const kind = c.kind === "dip" ? `<span class="tag dip">DIP</span>` : `<span class="tag neu">NEU</span>`;
+    return `<div class="fav">
+      <div class="fh"><span class="rk">${i + 1}</span>
+        <div class="fm"><div class="nm">${coinA(c)}${kind}${hypePill(c.hype)}</div>
+          <div class="lbl">${esc(c.symbol || "")} · ${esc(c.stage || "")}</div></div>
+        <div class="fs"><div class="v">${Math.round(c.fav)}</div><div class="lbl">Score</div></div></div>
+      <div class="fl"><span class="lbl">Signal-Fortschritt</span>${segBar(c)}</div>
+      <div class="chips">${(c.reasons || []).map((r) => `<span class="chip">${esc(r)}</span>`).join("")}</div>
+      ${links2(c)}
+    </div>`;
+  }
+  function homeFavs() {
+    const r = R();
+    if (!r) return "";
+    const f = (r.favorites || []).slice(0, 5);
+    return `<div class="sec"><h2>Top-Favoriten</h2><button class="aside lnkb" data-go="/radar">ALLE IM RADAR ›</button></div>
+      ${f.length ? f.map(favCard).join("") : `<div class="empty">Gerade kein Favorit · Scanner und Dip-Watch suchen weiter</div>`}`;
+  }
+  function signalsBlock(n) {
+    const r = R();
+    const sg = (r && r.signals) || [];
+    if (!sg.length) return `<div class="sec"><h2>Letzte Signale</h2><span class="aside">24 h</span></div><div class="empty">Noch keine Signale in den letzten 24 h.</div>`;
+    const rows = sg.slice(0, n || 12).map((x) => {
+      const src = x.source === "dip" ? "DIP" : x.source === "reentry" ? "RE" : "NEU";
+      const open = x.status === "open";
+      return `<div class="tr sig">
+        <div class="t">${hhmm(x.opened_at)}</div>
+        <div class="k ${open ? "buy" : (num(x.pct) || 0) >= 0 ? "good" : "bad"}">${open ? "OFFEN" : src}</div>
+        <div class="m"><div class="n">${coinA(x, x.name)}</div><div class="d">${esc(x.mode || "")}${x.exit ? " · " + esc(EXIT_DE[x.exit] || x.exit) : ""} · ${link(x.dex, "Dex ↗")}</div></div>
+        <div class="r ${cls(x.pct)}">${x.pct != null ? spct(x.pct) : "—"}</div></div>`;
+    }).join("");
+    return `<div class="sec"><h2>Letzte Signale</h2><span class="aside">24 h · ${sg.length}</span></div><div class="tape">${rows}</div>`;
+  }
+  function progCard(c) {
+    const det = (c.steps || []).map((s) => `<div class="st"><span class="sl">${esc(s.label)}</span><span class="sd">${esc(s.detail)}</span><span class="sp ${s.pct >= 100 ? "pos-c" : s.pct > 0 ? "amb" : "dimc"}">${s.pct} %</span></div>`).join("");
+    return `<details class="prog" data-k="${esc(c.kind + ":" + c.mint)}"><summary>
+        <div class="pr1"><div class="nm">${coinA(c)}${c.kind === "dip" ? `<span class="tag dip">DIP</span>` : ""}${hypePill(c.hype)}</div><span class="stg">${esc(c.stage)}</span></div>
+        ${segBar(c)}</summary>
+      <div class="steps">${c.out_why ? `<div class="st"><span class="sl neg-c">Raus</span><span class="sd neg-c">${esc(c.out_why)}</span><span></span></div>` : ""}${det}${c.why && c.kind === "dip" ? `<div class="st"><span class="sl">Fehlt noch</span><span class="sd">${esc(c.why === "history" ? "zu wenig Kursverlauf" : c.why)}</span><span></span></div>` : ""}</div>
+      ${links2(c)}</details>`;
+  }
+  function hypeCard(h) {
+    const age = ageSec(h.ts);
+    const prev = num(h.mentions_prev_15m) || 0, cur = num(h.mentions_15m) || 0;
+    const trend = cur > prev ? "pos-c" : cur < prev ? "neg-c" : "mut";
+    const d = HYPE_DE[h.label] || ["?", "ne"];
+    const old = age != null && age / 60 > (num(R().hype_age_max_min) || 45);
+    return `<div class="hyc ${d[1]}">
+      <div class="pr1"><div class="nm">${coinA(h, h.name)}</div>${hypePill(h)}</div>
+      ${pctBar(h.score, h.label === "hype" ? "g" : h.label === "shill" ? "r" : "b")}
+      <div class="grid4">
+        <div><div class="lbl">Erwähn. 15 Min</div><div class="v ${trend}">${cur} <small class="dimc">vs ${prev}</small></div></div>
+        <div><div class="lbl">Autoren</div><div class="v">${esc(h.unique_authors)}</div></div>
+        <div><div class="lbl">Verdächtig</div><div class="v ${num(h.suspicious_share) >= 50 ? "neg-c" : ""}">${esc(h.suspicious_share)} %</div></div>
+        <div><div class="lbl">Daten</div><div class="v ${old ? "amb" : ""}">vor ${ageTxt(age)}</div></div>
+      </div>
+      ${links2(h)}</div>`;
+  }
+  function legend() {
+    const r = R(); const w = (r && r.weights) || {};
+    const n = w.new || {}, d = w.dip || {}, f = w.fav || {};
+    const pc = (x) => Math.round((x || 0) * 100);
+    return `<details class="panel legendp" data-k="legend"><summary>Legende · wie die Prozente entstehen</summary>
+      <p><b>Signal-Fortschritt (neue Coins)</b>: Scanner ${n.scanner}% (Pool reift bis ${esc((state.settings || {}).min_pool_age_min)} Min, dann voll) · Auditor ${n.auditor}% (bestandene Ebenen von 8) · Analyst ${n.analyst}% (Score bis Mindest-Score ${esc(r && r.min_score)}) · X-Hype ${n.hype}% (Hype voll, neutral halb, Shill/keine Daten 0). 100 % = Signal gesendet.</p>
+      <p><b>Dip-Watch</b>: Abstand vom 60-Min-Hoch bis ${esc((state.settings || {}).dip_min_pct)} % = ${d.dip}% · Volumen 5 Min bis ${esc((state.settings || {}).dip_min_vol_m5)} $ = ${d.vol}% · Kurs dreht (5 Min > 0) = ${d.m5}% · Käufer ≥ 1,1× Verkäufer = ${d.flow}%. Bei mehr als ${esc((state.settings || {}).dip_max_pct)} % Abstand zählt der Dip nicht.</p>
+      <p><b>X-Hype</b>: Score 0–100 % aus Erwähnungen der letzten 15 Min gegen die 15 Min davor, Zahl der Autoren und Anteil verdächtiger Accounts. Hype gibt +${esc((state.settings || {}).hype_bonus)} Punkte, Shill −${esc((state.settings || {}).hype_shill_penalty)}. Hype allein löst nie ein Signal aus.</p>
+      <p><b>Favoriten-Score</b>: ${pc(f.progress)}% Signal-Fortschritt · ${pc(f.quality)}% Qualität (Analyst-Score; Dip-Coins mit bestandenem Audit 60) · ${pc(f.hype)}% X-Hype · ${pc(f.liq)}% Liquidität (voll ab 50k $) · ${pc(f.momentum)}% Momentum 15 Min. Shill −15. Keine Kaufempfehlung, nur Rangliste.</p>
+    </details>`;
+  }
+  function viewRadar() {
+    const r = R();
+    if (!r) return `<h1 class="screen">Radar</h1><div class="empty">${state && state.radar && state.radar.error ? "Radar konnte nicht berechnet werden." : "Radar kommt mit dem nächsten Update."}</div>`;
+    const favs = r.favorites || [], cands = (r.candidates || []).filter((c) => c.kind !== "dip"), dips = r.dip || [], hype = r.hype || [];
+    return `<h1 class="screen">Radar</h1>
+      ${legend()}
+      <div class="sec"><h2>Top-Favoriten</h2><span class="aside">${favs.length} · Rangliste</span></div>
+      ${favs.length ? favs.map(favCard).join("") : `<div class="empty">Gerade kein Favorit.</div>`}
+      <div class="sec"><h2>Signal-Fortschritt</h2><span class="aside">neue Coins · ${r.window_h} h · ${r.out_count || 0} raus</span></div>
+      ${cands.length ? cands.map(progCard).join("") : `<div class="empty">Gerade kein neuer Kandidat in der Pipeline.</div>`}
+      <div class="sec"><h2>Dip-Watch</h2><span class="aside">${dips.length} Coins${r.dip_ts ? " · " + hhmm(r.dip_ts) : ""}</span></div>
+      ${dips.length ? dips.map(progCard).join("") : `<div class="empty">Dip-Liste ist leer.</div>`}
+      <div class="sec"><h2>X-Hype</h2><span class="aside">letzte 60 Min · ${hype.length}</span></div>
+      ${hype.length ? hype.map(hypeCard).join("") : `<div class="empty">Keine frischen X-Daten. Die Hype-Prüfung läuft alle 30 Min.</div>`}
+      ${signalsBlock(12)}`;
+  }
+
+  /* ------------------------------------------------------------ stats */
+  function viewStats() {
+    const S = state && state.stats;
+    if (!S || S.error) {
+      return `<h1 class="screen">Statistik</h1><div class="empty">${S && S.error ? "Statistik konnte nicht berechnet werden." : "Noch keine Statistik verfügbar. Sie kommt mit dem nächsten Update."}</div>`;
+    }
+    const m = S.modes[statMode] ? statMode : "ALL";
+    const s = S.modes[m];
+    const seg = `<div class="seg">${["ALL", "LIVE", "PAPER"].map((k) =>
+      `<button data-stat="${k}" class="${k === m ? "on" : ""}">${k === "ALL" ? "ALLE" : k} <span class="dimc">${S.modes[k] ? S.modes[k].trades : 0}</span></button>`).join("")}</div>`;
+    const few = !s.enough ? `<div class="note">Zu wenige Trades für Aussagen: ${s.trades} von mindestens ${S.min_trades || 10} abgeschlossenen Trades. Die Zahlen sind noch nicht aussagekräftig.</div>` : "";
+    const pf = s.profit_factor === "inf" ? "∞" : (s.profit_factor != null ? String(s.profit_factor).replace(".", ",") : "—");
+    const k = (l, v, sub, c) => `<div class="kpi"><div class="lbl">${l}</div><div class="v ${c || ""}">${v}</div>${sub != null ? `<div class="s">${sub}</div>` : ""}</div>`;
+    const bw = (t) => t ? `${coinA(t, t.name)}` : "—";
+    const kpis = `<div class="kpis">
+      ${k("PnL netto", smoney(s.pnl), "Gebühren " + money(s.fees), cls(s.pnl))}
+      ${k("Trades", esc(s.trades), `${s.wins} ▲ · ${s.losses} ▼`)}
+      ${k("Win-Rate", s.win_rate != null ? String(s.win_rate).replace(".", ",") + "%" : "—", "TP1 " + s.tp1_hits + "× · TP2 " + s.tp2_hits + "×")}
+      ${k("Ø Gewinn", smoney(s.avg_win), null, "pos-c")}
+      ${k("Ø Verlust", smoney(s.avg_loss), null, s.avg_loss != null ? "neg-c" : "")}
+      ${k("Profit-Faktor", pf, "Gew. ÷ Verl.")}
+      ${k("Erwartung", smoney(s.expectancy), "pro Trade", cls(s.expectancy))}
+      ${k("Max. Drawdown", s.max_dd ? "−" + money(s.max_dd) : money(0), s.max_dd_pct ? "−" + String(s.max_dd_pct).replace(".", ",") + "% vom Hoch" : "vom Hoch", s.max_dd ? "neg-c" : "")}
+      ${k("Ø Haltedauer", dur(s.avg_hold_min), null)}
+    </div>
+    <div class="kpis two" style="margin-top:8px">
+      ${k("Bester Trade", s.best ? `<span class="pos-c">${smoney(s.best.pnl)}</span>` : "—", s.best ? bw(s.best) + " · " + spct(s.best.pct) : null)}
+      ${k("Schlechtester Trade", s.worst ? `<span class="${cls(s.worst.pnl)}">${smoney(s.worst.pnl)}</span>` : "—", s.worst ? bw(s.worst) + " · " + spct(s.worst.pct) : null)}
+    </div>`;
+
+    const eqLegend = m === "ALL"
+      ? `<div class="legend"><span><i style="background:#e6e9ef"></i>Gesamt</span><span><i style="background:var(--red)"></i>LIVE</span><span><i style="background:var(--blue)"></i>PAPER</span></div>`
+      : `<div class="legend"><span><i style="background:${m === "LIVE" ? "var(--red)" : "var(--blue)"}"></i>${m} kumuliert nach Gebühren</span></div>`;
+    const charts = `
+      <div class="sec"><h2>Equity-Kurve</h2><span class="aside">kumulierter PnL</span></div>
+      <div class="panel"><div class="chartbox"><canvas class="chart2" id="eqChart"></canvas></div>${eqLegend}</div>
+      <div class="sec"><h2>PnL pro Tag</h2><span class="aside">${s.daily.length} Tage</span></div>
+      <div class="panel"><div class="chartbox"><canvas class="chart2" id="dayChart" style="height:140px"></canvas></div></div>`;
+
+    const maxE = Math.max(1, ...s.exits.map((e) => e.n));
+    const exits = `<div class="sec"><h2>Exit-Gründe</h2><span class="aside">${s.trades} geschlossen</span></div>
+      <div class="panel bars">${s.exits.map((e) => `<div class="bar">
+        <div class="l">${esc(EXIT_DE[e.reason] || e.reason)}</div>
+        <div class="track"><div class="fill ${EXIT_COL[e.reason] || ""}" style="width:${e.n ? (e.n / maxE * 100) : 0}%"></div></div>
+        <div class="x">${e.n}× <small class="${cls(e.pnl)}">${e.n ? smoney(e.pnl).replace(" $", "$") : ""}</small></div>
+      </div>`).join("")}</div>`;
+
+    const F = S.funnel || [];
+    const top = Math.max(1, ...F.map((f) => f.n));
+    const funnel = `<div class="sec"><h2>Scanner-Trichter</h2><span class="aside">alle Modi</span></div>
+      <div class="panel bars">${F.map((f, i) => {
+        const prev = i ? F[i - 1].n : null;
+        const conv = prev ? Math.round(f.n / prev * 100) + "%" : "";
+        return `<div class="bar"><div class="l">${esc(f.label)}</div>
+          <div class="track"><div class="fill a" style="width:${f.n / top * 100}%;opacity:${1 - i * 0.07}"></div></div>
+          <div class="x">${f.n} <small>${conv}</small></div></div>`;
+      }).join("")}</div>`;
+
+    const R = S.rejections || [];
+    const topR = Math.max(1, ...R.map((r) => r.n));
+    const rej = `<div class="sec"><h2>Top-Ablehnungsgründe</h2><span class="aside">alle Agenten</span></div>
+      ${R.length ? `<div class="panel bars">${R.map((r) => `<div class="bar"><div class="l" title="${esc(r.agent || "")}">${esc(r.label)}</div>
+        <div class="track"><div class="fill r" style="width:${r.n / topR * 100}%"></div></div>
+        <div class="x">${r.n}× <small>${esc({ Scanner: "SCN", Auditor: "AUD", Analyst: "ANA", Brain: "BRN" }[r.agent] || "")}</small></div></div>`).join("")}</div>`
+        : `<div class="empty">Noch keine Ablehnungen.</div>`}`;
+
+    const rec = (S.recent || []).filter((t) => m === "ALL" || t.mode === m);
+    const trades = `<div class="sec"><h2>Letzte Trades</h2><span class="aside">${rec.length}</span></div>
+      ${rec.length ? `<div class="panel" style="overflow-x:auto"><table class="tb">
+        <tr><th>Zeit</th><th>Coin</th><th>Exit</th><th class="rt">PnL</th><th class="rt">%</th></tr>
+        ${rec.map((t) => `<tr><td class="mono dimc">${ddmm(t.closed_at)} ${hhmm(t.closed_at)}</td>
+          <td class="nm">${coinA(t, t.name)} <span class="tag ${esc(t.mode)}">${esc(t.mode[0])}</span></td>
+          <td class="mut">${esc((EXIT_DE[t.reason] || t.reason).replace(" (Teilgewinn)", ""))}</td>
+          <td class="rt ${cls(t.pnl)}">${smoney(t.pnl)}</td><td class="rt ${cls(t.pct)}">${spct(t.pct)}</td></tr>`).join("")}
+      </table></div>` : `<div class="empty">Noch keine geschlossenen Trades in ${m === "ALL" ? "keinem Modus" : m}.</div>`}`;
+
+    return `<h1 class="screen">Statistik</h1>${seg}${few}${kpis}${charts}${exits}${funnel}${rej}${trades}`;
+  }
+
+  /* ------------------------------------------------------------ agents */
+  function viewAgents() {
+    const A = (state && state.agents) || {};
+    const cards = AGENTS.map(([k, label, icon]) => {
+      const a = A[k] || { name: label };
+      const age = hbAge(k);
+      const pills = a.pills ? `<div class="pills">
+        ${a.pills.stop ? `<span class="pill stop">${esc(a.pills.stop)}</span>` : ""}
+        ${a.pills.trail ? `<span class="pill trail">${esc(a.pills.trail)}</span>` : ""}
+        ${a.pills.tp ? `<span class="pill tp">${esc(a.pills.tp)}</span>` : ""}</div>` : "";
+      let feed = "";
+      if (k === "brain" && a.decisions && a.decisions.length) {
+        feed = a.decisions.slice(0, 6).map((d) => `<div class="tr ${d.skipped ? "kill" : ""}">
+          <div class="m"><div class="n">${coinA(d, d.name || d.symbol || d.mint)}</div>
+          <div class="d">${d.skipped ? esc(d.reason || "übersprungen") : "Score " + esc(d.score) + (d.capHit ? " · Limit " + esc(d.capHit) : "")}</div></div>
+          <div class="r">${d.skipped ? "SKIP" : money(d.sizeUsd)}</div></div>`).join("");
+      } else if (k === "scanner" && a.feed && a.feed.length) {
+        feed = a.feed.slice(0, 6).map((f) => `<div class="tr ${f.verdict === "kill" ? "kill" : ""}">
+          <div class="m"><div class="n">${coinA(f, f.name || f.symbol)}</div>
+          <div class="d">${hhmm(f.ts)} · ${f.verdict === "pass" ? "→ Auditor" : esc(f.reason || "")}</div></div>
+          <div class="r ${f.verdict === "pass" ? "pos-c" : "dimc"}">${f.verdict === "pass" ? "OK" : "RAUS"}</div></div>`).join("");
+      }
+      let extra = "";
+      if (k === "analyst" && a.last) {
+        const sc = Math.max(0, Math.min(100, num(a.last.score) || 0));
+        const min = num(a.min_score) || 70;
+        extra = `<div class="scorebar"><span>${sc}</span><div class="track"><div class="fill" style="width:${sc}%;background:${sc >= min ? "var(--green)" : "var(--red)"}"></div>
+          <div class="min" style="left:${min}%"></div></div><span class="dimc">min ${min}</span></div>
+          <div class="sub" style="margin-top:4px">Letzter: ${coinA(a.last, (a.last.mint || "").slice(0, 6) + "…")}</div>`;
+      }
+      if (k === "auditor") extra = `<div class="pills"><button class="pill" data-go="/auditor">LETZTES AUDIT ›</button></div>`;
+      return `<div class="ag">
+        <div class="h"><span class="ic">${icon}</span><span class="n">${esc(label)}</span>${a.paused ? `<span class="tag">PAUSIERT</span>` : ""}
+          <span class="age"><i class="dot ${dotCls(age, 180, 900)}"></i>${age == null ? "kein Signal" : "vor " + ageTxt(age)}</span></div>
+        <div class="big">${esc(a.card || "")}</div>
+        <div class="sub">${esc(a.sub || "")}</div>
+        ${extra}${pills}${feed ? `<div class="rows">${feed}</div>` : ""}
+      </div>`;
+    }).join("");
+    const sys = SYS.map(([k, n]) => { const g = hbAge(k); return `<div class="setrow"><div class="k">${n}</div><div class="v"><i class="dot ${dotCls(g, 180, 900)}"></i> ${g == null ? "—" : "vor " + ageTxt(g)}</div></div>`; }).join("");
+    const waiting = (state && state.waiting) || [];
+    return `<h1 class="screen">Agenten</h1><div class="agrid">${cards}</div>
+      <div class="sec"><h2>Warteschlange</h2><span class="aside">${waiting.length} Pools</span></div>
+      ${waiting.length ? `<div class="tape">${waiting.slice(0, 12).map((w) => `<div class="tr" style="grid-template-columns:40px 1fr"><div class="t">${hhmm(w.added_at)}</div><div class="m"><div class="n">${coinA(w, w.name || w.symbol || w.mint)}</div></div></div>`).join("")}</div>` : `<div class="empty">Keine Pools in der Warteschlange.</div>`}
+      <div class="sec"><h2>System</h2></div><div class="panel">${sys}</div>`;
+  }
+
+  function layersGrid(layers) {
+    return `<div class="layers">${layers.map((L) => {
+      const c = L.pass === true ? "ok" : (L.pass === false ? "red" : "");
+      const v = String(L.value == null ? "" : L.value).replace(/^Revoked$/, "entzogen").replace(/^not checked$/, "nicht geprüft");
+      return `<div class="layer ${c}"><div class="n">${esc(L.n)}. ${esc(LAYER_DE[L.n] || L.name)}</div><div class="v">${esc(v)}</div></div>`;
+    }).join("")}</div>`;
+  }
+
+  function viewAuditor(mint) {
+    const latest = (state && (mint && state.coins && state.coins[mint] && state.coins[mint].audit)) || (state && state.latest_audit);
+    const layers = (latest && latest.layers) || [];
+    let body;
+    if (!latest || !layers.length) {
+      body = `<div class="empty">Noch kein Audit. Der Auditor prüft Coins, sobald der Scanner sie durchlässt.</div>`;
+    } else {
+      const ok = layers.filter((L) => L.pass === true).length;
+      body = `<div class="panel infop">
+        <div class="lbl">${hhmm(latest.ts)} · ${latest.holders != null ? esc(latest.holders) + " Holder" : ""}</div>
+        <div class="big" style="font-family:var(--mono);font-size:17px;margin:4px 0">${latest.link ? coinA(latest, latest.name || latest.mint) : esc(latest.mint || "")}</div>
+        <div class="${latest.passed ? "pos-c" : "neg-c"} mono">${latest.passed ? "8/8 BESTANDEN → Analyst" : ok + "/8 · ABGELEHNT: " + esc(latest.reason || "")}</div>
+      </div><div style="margin-top:8px">${layersGrid(layers)}</div>`;
+    }
+    return `<button class="back" data-go="/agents">‹ Agenten</button><h1 class="screen">Auditor</h1>${body}`;
+  }
+
+  function viewCoin(mint) {
+    const c = state && state.coins && state.coins[mint];
+    if (!c) {
+      return `<button class="back" data-go="/home">‹ Desk</button><h1 class="screen">Coin</h1><div class="empty">Diesen Coin kenne ich noch nicht.</div>`;
+    }
+    const pos = c.position;
+    const prices = (c.prices || []).map((p) => num(p.price)).filter((x) => x != null);
+    const last = prices.length ? prices[prices.length - 1] : null;
+    const first = prices.length ? prices[0] : null;
+    const chg = last != null && first ? (last / first - 1) * 100 : null;
+    return `<button class="back" data-go="/home">‹ Desk</button>
+      <div class="ph" style="margin:4px 2px 8px"><div><div class="nm" style="font-size:18px;font-weight:700">${esc(c.name || c.symbol || mint)}${pos ? `<span class="tag ${esc(pos.mode || "PAPER")}">${esc(pos.mode || "PAPER")}</span>` : ""}</div>
+        <div class="lbl">${esc(c.symbol || "")} · ${esc(String(mint).slice(0, 4))}…${esc(String(mint).slice(-4))}</div></div>
+        <div class="pnl"><div class="a">${price(last)}</div><div class="b ${cls(chg)}">${spct(chg)} im Fenster</div></div></div>
+      <canvas class="big" id="chart"></canvas>
+      <div class="legend" style="padding-top:6px"><span><i style="background:var(--green)"></i>Kurs</span><span><i style="background:var(--muted)"></i>Einstieg</span><span><i style="background:var(--orange)"></i>${pos && pos.trail_active ? "Trail" : "Stop"}</span><span><i style="background:var(--green)"></i>TP1/TP2</span></div>
+      ${pos ? posCard(Object.assign({}, pos, { prices: c.prices, pct: pos.pct, last_price: pos.last_price })).replace(/<canvas[^>]*><\/canvas>/, "").replace(/<button class="btn ghost"[^>]*>CHART<\/button>/, "") : `<div class="acts"><a class="btn" href="${esc(c.link)}" target="_blank" rel="noopener">AUF FOMO ÖFFNEN ↗</a></div>`}
+      <div class="sec"><h2>Auditor</h2></div>
+      ${c.audit && c.audit.layers ? layersGrid(c.audit.layers) : `<div class="empty">Kein Audit.</div>`}`;
+  }
+
+  /* ------------------------------------------------------------ account */
+  const SET_DE = {
+    min_size_usd: "Min. Größe ($)", max_size_usd: "Max. Größe ($)", max_pool_pct: "Max. % vom Pool",
+    stop_pct: "Stop (%)", trail_start_pct: "Trail ab (%)", trail_pct: "Trail-Abstand (%)", timeout_h: "Timeout (h)",
+    timeout_min_gain_pct: "Timeout min. Gewinn (%)", tp1_pct: "TP1 bei (%)", tp1_fraction: "TP1 Anteil", tp2_pct: "TP2 bei (%)", tp2_fraction: "TP2 Anteil",
+    min_ticket_usd: "Min. Ticket ($)", stack_pct: "% vom Stack", below_min: "Unter Minimum", recheck_liq_drop_pct: "Recheck Liq.-Abfall (%)", recheck_price_up_pct: "Recheck Preis-Anstieg (%)",
+    min_liquidity_usd: "Min. Liquidität ($)", max_top10_pct: "Max. Top-10 (%)", max_h1_change_pct: "Max. 1h-Anstieg (%)", min_score: "Min. Score",
+    stack_usd: "Stack für Größe ($)", risk_per_trade_pct: "Risiko je Trade (% vom Cash)", full_size_score: "Volle Größe ab Score", below_full_pct: "Größe unter Score (%)",
+    max_ticket_usd: "Max. Ticket ($)", max_trades_night: "Max. Trades je Nacht", tp_x: "Take-Profit bei (x)", tp_sell_pct: "TP-Verkauf (%)", night_loss_stop_pct: "Nacht-Verlustbremse (%)",
+    pulled_liq_drop_pct: "Liquidität weg bei Abfall (%)", dev_dump_pct: "Dev-Verkauf seit Kauf (%)", night_start: "Nacht-Start", lock_time: "Lock-Zeit (Flatten)",
+    dip_pct: "Dip-Einstieg (%)", dip_window_min: "Dip-Fenster Hoch (min)", dip_wait_min: "Max. Warten auf Dip (min)", crash_pct: "Crash ab (%)",
+    min_holders_growth_pct: "Min. Holder-Wachstum (%)", max_insider_pct: "Max. Insider (%)", max_fresh_pct: "Max. frische Wallets (%)", flush_sell_ratio: "Flush Sell/Buy-Faktor",
+    social_weight: "Social-Gewicht", shill_cut: "Shill-Grenze", exit_mode: "Exit-Modus", sizing_mode: "Größen-Modus", analyst_formula: "Analyst-Formel",
+    rugcheck_report_enabled: "RugCheck-Report prüfen", rugcheck_block_danger: "RugCheck: Danger-Risiken blockieren", rugcheck_max_score_normalised: "RugCheck Max. Score", rugcheck_ignore_risks: "RugCheck ignorierte Risiken",
+    dip_enabled: "Extra-Dip-Bot", reentry_enabled: "Re-Entry", night_window_enabled: "Nachtfenster aktiv",
+    analyst_mode: "Analyst-Modus", mode: "Modus", paper_balance: "Paper-Guthaben", paper_start_stack: "Paper-Startstack", fomo_handle: "FOMO-Handle",
+  };
+
+  /* ------------------------------------------------------------ copy picks (Konto) */
+  function cpAgo(ts) {
+    const t = num(ts); if (t == null) return "unbekannt";
+    const m = Math.floor((Date.now() / 1000 - t) / 60);
+    if (m < 1) return "gerade eben"; if (m < 120) return "vor " + m + " Min";
+    if (m < 2880) return "vor " + Math.floor(m / 60) + " h"; return "vor " + Math.floor(m / 1440) + " T";
+  }
+  function cpUsd(v, plus) {
+    const n = num(v); if (n == null) return "?";
+    const a = Math.abs(n), sign = n < 0 ? "−" : (plus ? "+" : "");
+    if (a >= 1e6) return sign + "$" + (a / 1e6).toFixed(1) + "M";
+    return a >= 1000 ? sign + "$" + (a / 1e3).toFixed(1) + "K" : sign + "$" + a.toFixed(0);
+  }
+  function cpWhy(it) {
+    const p = [];
+    p.push("24h und 7d im Plus"); if (it.coins25 != null) p.push(`${it.coins25} Coins in den letzten ${it.swaps25} Swaps`); if (it.partial_ev) p.push("verkauft in Teilen (" + it.partial_ev + ")");
+    if (it.trades != null) p.push(it.trades + " Trades");
+    if (it.note) p.push(it.note);
+    return p.join(" · ");
+  }
+  function viewCopyPicks() {
+    const c = copyData(); if (!c) return "";
+    const bot = c.tg_bot, man = new Set(c.manual || []);
+    const tg = (payload) => bot ? `https://t.me/${encodeURIComponent(bot)}?start=${payload}` : null;
+    const list = c.listing || [];
+    const cards = list.map((it, i) => {
+      const on = man.has(it.handle), h = it.handle;
+      const lb = it.last_buy;
+      const sw = it.followable
+        ? (tg(`cp_${on ? "off" : "on"}_${h}`)
+          ? `<a class="cpsw ${on ? "on" : ""}" href="${esc(tg(`cp_${on ? "off" : "on"}_${h}`))}" target="_blank" rel="noopener" role="switch" aria-checked="${on}"><span class="knob"></span></a>`
+          : `<span class="cpsw dis ${on ? "on" : ""}"><span class="knob"></span></span>`)
+        : `<span class="cpsw dis"><span class="knob"></span></span>`;
+      return `<div class="cpcard">
+        <div class="cph"><div><b>#${i + 1} ${esc(h)}</b><div class="cps">${esc(cpAgo(it.last_trade_ts))} letzter Trade · ${esc(it.trades == null ? "?" : it.trades)} Trades${it.mode === "feed" ? " · FOMO-Feed" : it.mode === "wallet" ? " · Wallet" : ""}</div></div>
+          <div class="cpnums"><span class="pos-c">7d ${esc(cpUsd(it.pnl_7d, true))}</span><span class="pos-c">24h ${esc(cpUsd(it.pnl_24h, true))}</span></div></div>
+        <div class="cpwhy">${esc(cpWhy(it))}</div>
+        ${lb && lb.url ? `<a class="cplb" href="${esc(lb.url)}" target="_blank" rel="noopener"><span>Last buy</span><b>${esc(lb.coin || "Coin")}${lb.mc ? " · " + esc(cpUsd(lb.mc, false)) + " MC" : ""}</b><span>↗</span></a>` : `<div class="cplb dis"><span>Last buy</span><b>keine Daten</b></div>`}
+        <div class="cpf"><a class="cpbtn" href="${esc(it.profile_url)}" target="_blank" rel="noopener">Profile ↗</a>
+          <div class="cpswrow"><span>Copy on desk${it.followable ? "" : " (nicht kopierbar)"}</span>${sw}</div></div>
+      </div>`;
+    }).join("");
+    const every = c.every || "reader";
+    const lab = (v) => (v === "off" ? "aus" : v === "reader" ? "22:10 + 04:10" : v);
+    const chip = (v) => { const u = tg("ce_" + v); const a = `chip${every === v ? " on" : ""}`; return u ? `<a class="${a}" href="${esc(u)}" target="_blank" rel="noopener">${lab(v)}</a>` : `<span class="${a}">${lab(v)}</span>`; };
+    const hist = (c.hist || []).slice().reverse().map((h) => {
+      const d = new Date(h.ts);
+      const when = isNaN(d) ? "?" : d.toLocaleString("de-DE", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", timeZone: "Europe/Berlin" });
+      return `<div class="cphist"><div class="k">${esc(when)}</div><div class="v">${(h.items || []).map((x) => esc(x.handle) + " " + esc(cpUsd(x.pnl_7d, true))).join(" · ") || "niemand"}</div></div>`;
+    }).join("");
+    const nMan = man.size;
+    return `<div class="sec"><h2>Copy picks</h2></div>
+      <div class="panel infop cpinfo">
+        <p>${list.length} Trader heute (Regeln wie savipww: 24h und 7d im Plus, ≥5 Coins in den letzten 25 Swaps, verkauft in Teilen, letzter Trade ≤24 h). Papier-Kopien, Topf ${esc(c.pot_start || 50)} $.
+        ${nMan ? `<b>Manuell: ${esc([...man].map((x) => "@" + x).join(", "))}</b> werden statt der Auto-Auswahl kopiert.` : "Kein Schalter an: automatische Auswahl."}</p>
+        <div class="cpevery"><span>${every === "reader" ? "Takt: nach jedem FOMO-Reader-Lauf (22:10 und 04:10 Berlin)" : "Takt (ab " + esc(c.pick_time || "22:10") + " Uhr Berlin)"}</span><div class="chips">${["reader", "off", "24h", "12h", "6h"].map(chip).join("")}</div></div>
+        <p class="mut" style="font-size:11px">Schalter und Takt öffnen Telegram und senden den Befehl an den Desk (max. ${esc(c.max_follow || 2)} an). Die App selbst kann nichts schreiben.</p>
+      </div>
+      ${cards || `<div class="panel infop"><p>Noch keine Liste. Sie kommt mit dem nächsten Pick.</p></div>`}
+      ${hist ? `<details class="panel cphistw"><summary>Verlauf (letzte ${(c.hist || []).length} Listen)</summary>${hist}</details>` : ""}`;
+  }
+  function viewAccount() {
+    const s = (state && state.settings) || {};
+    const groups = [
+      { id: "scanner", title: "Scanner", keys: ["min_liquidity_usd", "max_top10_pct", "max_h1_change_pct", "min_holders_growth_pct", "min_pool_age_min", "max_wait_min"] },
+      { id: "analyst", title: "Analyst", keys: ["max_insider_pct", "max_fresh_pct", "flush_sell_ratio", "chase_h1_pct", "social_weight", "shill_cut", "min_score"] },
+      { id: "brain", title: "Brain · Größe", keys: ["stack_usd", "risk_per_trade_pct", "full_size_score", "below_full_pct", "max_pool_pct", "min_ticket_usd", "max_ticket_usd", "max_trades_night"] },
+      { id: "executor", title: "Executor · Dip-Einstieg", keys: ["dip_pct", "dip_window_min", "dip_wait_min", "crash_pct", "recheck_liq_drop_pct", "recheck_price_up_pct"] },
+      { id: "risk", title: "Risk · Exits", keys: ["stop_pct", "tp_x", "tp_sell_pct", "trail_pct", "timeout_h", "timeout_min_gain_pct", "pulled_liq_drop_pct", "dev_dump_pct", "risk_poll_s", "night_loss_stop_pct", "night_start", "lock_time", "night_window_enabled"] },
+      { id: "extras", title: "Extras (aus)", keys: ["dip_enabled", "reentry_enabled", "exit_mode", "sizing_mode", "analyst_formula"] },
+    ];
+    const used = new Set(groups.flatMap((g) => g.keys));
+    const rest = Object.keys(s).filter((k) => !used.has(k)).sort();
+    const val = (v) => (v != null && typeof v === "object") ? JSON.stringify(v) : (typeof v === "number" ? String(Math.round(v * 1000) / 1000).replace(".", ",") : v);
+    const row = (k) => `<div class="setrow"><div class="k">${esc(SET_DE[k] || k)}${SET_DE[k] ? `<small>${esc(k)}</small>` : ""}</div><div class="v">${esc(val(s[k]))}</div></div>`;
+    const blocks = groups.map((g) => {
+      const rows = g.keys.filter((k) => k in s).map(row).join("");
+      return rows ? `<div class="sec"><h2>${esc(g.title)}</h2></div><div class="panel settings-group" data-group="${esc(g.id)}">${rows}</div>` : "";
+    }).join("");
+    const more = rest.length ? `<div class="sec"><h2>Weitere</h2></div><div class="panel">${rest.map(row).join("")}</div>` : "";
+    const bal = (state && state.balances) || {};
+    return `<h1 class="screen">Konto</h1>
+      <div class="kpis two">
+        <div class="kpi"><div class="lbl">Live-Stack</div><div class="v big">${money(bal.LIVE)}</div><div class="s">dein FOMO-Konto</div></div>
+        <div class="kpi"><div class="lbl">Paper-Stack</div><div class="v big">${money(bal.PAPER)}</div><div class="s">Simulation</div></div>
+      </div>
+      <div class="panel infop" style="margin-top:8px">
+        <div class="lbl">Benachrichtigung</div>
+        <div class="mono" style="font-size:15px;margin-top:2px">Telegram</div>
+        <p>${esc((state && state.notifier_note) || "Web-Push ist in Plan B nicht verfügbar. Meldungen kommen über Telegram.")}</p>
+        <p>${state && state.profile_url ? link(state.profile_url, "FOMO-Profil " + (state.fomo_handle || "olli81") + " ↗") : ""}
+        ${state && state.signup_url ? " · " + link(state.signup_url, "Einladungslink ↗") : ""}</p>
+        <p>Einstellungen sind hier nur lesbar. Ändern geht per Telegram, z. B. „set stop to -8%“.</p>
+      </div>
+      ${viewCopyPicks()}${blocks}${more}`;
+  }
+
+  /* ------------------------------------------------------------ canvas */
+  function setup(cnv) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(10, cnv.clientWidth), h = Math.max(10, cnv.clientHeight);
+    cnv.width = Math.round(w * dpr); cnv.height = Math.round(h * dpr);
+    const ctx = cnv.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = "10px ui-monospace, Menlo, monospace";
+    return { ctx, w, h };
+  }
+  function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#888"; }
+  function noData(ctx, w, h, txt) {
+    ctx.fillStyle = "#555e70"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(txt, w / 2, h / 2); ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  }
+
+  function drawPriceChart(cnv, pts, pos, settings) {
+    const { ctx, w, h } = setup(cnv);
+    const prices = (pts || []).map((p) => num(p.price)).filter((x) => x != null);
+    if (prices.length < 2) { noData(ctx, w, h, "Noch keine Kursdaten"); return; }
+    const st = settings || {};
+    const entry = pos ? num(pos.entry_price) : null;
+    const stopPct = pos ? num(pos.stop_pct) : null;
+    const stop = pos && pos.trail_active && num(pos.peak_price) != null
+      ? num(pos.peak_price) * (1 - (num(st.trail_pct) || 12) / 100)
+      : (entry != null && stopPct != null ? entry * (1 - stopPct / 100) : null);
+    const art = st.exit_mode === "article";
+    const tp1 = entry != null ? (art ? entry * (num(st.tp_x) || 2) : entry * (1 + (num(pos.tp1_pct != null ? pos.tp1_pct : st.tp1_pct) || 50) / 100)) : null;
+    const tp2 = (entry != null && !art) ? entry * (1 + (num(pos.tp2_pct != null ? pos.tp2_pct : st.tp2_pct) || 100) / 100) : null;
+    let lo = Math.min(...prices), hi = Math.max(...prices);
+    [stop, entry].forEach((v) => { if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } });
+    // only stretch to TP lines when they're within reach (keeps the chart readable)
+    [tp1, tp2].forEach((v) => { if (v != null && v < hi * 1.25) hi = Math.max(hi, v); });
+    if (lo === hi) { lo *= 0.99; hi *= 1.01; }
+    const padR = 54, padT = 6, padB = 6;
+    const xs = (i) => 2 + (i / (prices.length - 1)) * (w - padR - 4);
+    const ys = (p) => padT + (1 - (p - lo) / (hi - lo)) * (h - padT - padB);
+    // grid
+    ctx.strokeStyle = "#141922"; ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) { const y = Math.round(padT + i * (h - padT - padB) / 4) + 0.5; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w - padR, y); ctx.stroke(); }
+    const up = entry != null ? prices[prices.length - 1] >= entry : prices[prices.length - 1] >= prices[0];
+    const col = up ? css("--green") : css("--red");
+    // area
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, up ? "rgba(25,210,122,.28)" : "rgba(255,77,94,.28)"); g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.beginPath(); prices.forEach((p, i) => i ? ctx.lineTo(xs(i), ys(p)) : ctx.moveTo(xs(i), ys(p)));
+    ctx.lineTo(xs(prices.length - 1), h); ctx.lineTo(xs(0), h); ctx.closePath(); ctx.fillStyle = g; ctx.fill();
+    ctx.beginPath(); prices.forEach((p, i) => i ? ctx.lineTo(xs(i), ys(p)) : ctx.moveTo(xs(i), ys(p)));
+    ctx.strokeStyle = col; ctx.lineWidth = 1.6; ctx.stroke();
+    const line = (v, c, label) => {
+      if (v == null || v < lo || v > hi) return;
+      const y = Math.round(ys(v)) + 0.5;
+      ctx.strokeStyle = c; ctx.setLineDash([4, 3]); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w - padR, y); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = c; ctx.fillText(label, w - padR + 4, Math.min(h - 2, Math.max(9, y + 3)));
+    };
+    line(entry, "#8a93a6", "EIN");
+    line(stop, css("--orange"), pos && pos.trail_active ? "TRAIL" : "STOP");
+    line(tp1, css("--green"), art ? "TP" : "TP1");
+    line(tp2, css("--green"), "TP2");
+    // last price tag
+    const lp = prices[prices.length - 1], ly = ys(lp);
+    ctx.fillStyle = col; ctx.fillRect(w - padR + 2, ly - 7, padR - 2, 14);
+    ctx.fillStyle = "#000"; ctx.fillText(price(lp).slice(0, 9), w - padR + 4, ly + 3.5);
+  }
+
+  function drawEquity() {
+    const cnv = document.getElementById("eqChart");
+    if (!cnv) return;
+    const { ctx, w, h } = setup(cnv);
+    const S = state.stats.modes;
+    const m = S[statMode] ? statMode : "ALL";
+    const series = m === "ALL"
+      ? [["ALL", "#e6e9ef", 2], ["LIVE", css("--red"), 1.2], ["PAPER", css("--blue"), 1.2]]
+      : [[m, m === "LIVE" ? css("--red") : css("--blue"), 2]];
+    const data = series.map(([k, c, lw]) => ({ c, lw, pts: (S[k].equity || []).map((p) => ({ t: toDate(p.ts).getTime(), v: num(p.v) })) }))
+      .filter((s) => s.pts.length);
+    if (!data.length) { noData(ctx, w, h, "Noch keine geschlossenen Trades"); return; }
+    let t0 = Infinity, t1 = -Infinity, lo = 0, hi = 0;
+    data.forEach((s) => s.pts.forEach((p) => { t0 = Math.min(t0, p.t); t1 = Math.max(t1, p.t); lo = Math.min(lo, p.v); hi = Math.max(hi, p.v); }));
+    // start each curve at 0 slightly before the first trade
+    const span = Math.max(t1 - t0, 3600 * 1000);
+    t0 = t0 - span * 0.08; t1 = Math.max(t1, Date.now());
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const pad = (hi - lo) * 0.12; hi += pad; lo -= pad;
+    const L = 40, R = 6, T = 6, B = 16;
+    const xs = (t) => L + (t - t0) / (t1 - t0) * (w - L - R);
+    const ys = (v) => T + (1 - (v - lo) / (hi - lo)) * (h - T - B);
+    ctx.strokeStyle = "#141922"; ctx.fillStyle = "#555e70"; ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const v = lo + (hi - lo) * i / 4, y = Math.round(ys(v)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(w - R, y); ctx.stroke();
+      ctx.fillText(nf2.format(v), 2, y + 3);
+    }
+    ctx.strokeStyle = "#3a4252"; ctx.setLineDash([3, 3]);
+    const y0 = Math.round(ys(0)) + 0.5; ctx.beginPath(); ctx.moveTo(L, y0); ctx.lineTo(w - R, y0); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#555e70";
+    ctx.fillText(ddmm(new Date(t0).toISOString()) + " " + hhmm(new Date(t0).toISOString()), L, h - 3);
+    const endLbl = "jetzt"; ctx.fillText(endLbl, w - R - ctx.measureText(endLbl).width, h - 3);
+    data.forEach((s) => {
+      ctx.beginPath(); ctx.moveTo(xs(t0), ys(0));
+      let prev = 0;
+      s.pts.forEach((p) => { ctx.lineTo(xs(p.t), ys(prev)); ctx.lineTo(xs(p.t), ys(p.v)); prev = p.v; });
+      ctx.lineTo(xs(t1), ys(prev));
+      ctx.strokeStyle = s.c; ctx.lineWidth = s.lw; ctx.stroke();
+      s.pts.forEach((p) => { ctx.fillStyle = s.c; ctx.beginPath(); ctx.arc(xs(p.t), ys(p.v), 2.2, 0, Math.PI * 2); ctx.fill(); });
+    });
+  }
+
+  function drawDaily() {
+    const cnv = document.getElementById("dayChart");
+    if (!cnv) return;
+    const { ctx, w, h } = setup(cnv);
+    const S = state.stats.modes;
+    const m = S[statMode] ? statMode : "ALL";
+    const d = (S[m].daily || []).slice(-14);
+    if (!d.length) { noData(ctx, w, h, "Noch keine Tageswerte"); return; }
+    let hi = Math.max(0, ...d.map((x) => x.pnl)), lo = Math.min(0, ...d.map((x) => x.pnl));
+    if (hi === lo) hi = 1;
+    const L = 40, R = 6, T = 14, B = 16;
+    const ys = (v) => T + (1 - (v - lo) / (hi - lo)) * (h - T - B);
+    ctx.strokeStyle = "#141922"; ctx.fillStyle = "#555e70"; ctx.lineWidth = 1;
+    [hi, 0, lo].forEach((v) => { const y = Math.round(ys(v)) + 0.5; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(w - R, y); ctx.stroke(); ctx.fillText(nf2.format(v), 2, y + 3); });
+    const slot = (w - L - R) / Math.max(d.length, 7);
+    const bw = Math.min(28, slot * 0.6);
+    d.forEach((x, i) => {
+      const cx = L + slot * i + slot / 2;
+      const y1 = ys(Math.max(0, x.pnl)), y2 = ys(Math.min(0, x.pnl));
+      ctx.fillStyle = x.pnl >= 0 ? css("--green") : css("--red");
+      ctx.fillRect(cx - bw / 2, y1, bw, Math.max(1, y2 - y1));
+      ctx.fillStyle = "#8a93a6"; ctx.textAlign = "center";
+      ctx.fillText(ddmm(x.day), cx, h - 3);
+      ctx.fillStyle = x.pnl >= 0 ? css("--green") : css("--red");
+      ctx.fillText((x.pnl >= 0 ? "+" : "") + nf2.format(x.pnl), cx, x.pnl >= 0 ? y1 - 3 : y2 + 10);
+      ctx.textAlign = "left";
+    });
+  }
+
+  function drawAll(route) {
+    if (!state) return;
+    document.querySelectorAll("canvas.mini").forEach((cnv) => {
+      const mint = cnv.getAttribute("data-mint");
+      const pos = (state.positions || []).find((p) => p.mint === mint);
+      drawPriceChart(cnv, (pos && pos.prices) || [], pos, state.settings);
+    });
+    if (route === "coin") {
+      const cnv = document.getElementById("chart");
+      const { mint } = parseHash();
+      const c = state.coins && state.coins[mint];
+      if (cnv && c) drawPriceChart(cnv, c.prices || [], c.position, state.settings);
+    }
+    if (route === "stats" && state.stats && state.stats.modes) { drawEquity(); drawDaily(); }
+    if (route === "terminal") { try { drawTermChart(); } catch (e) { /* chart must never break the page */ } }
+  }
+
+  /* ------------------------------------------------------------ copy test (paper) */
+  function copyData() { const t = T(); return (t && t.bots && t.bots.copy) || null; }
+  function copyPosRow(o) {
+    const nm = cname(o); const up = o.pnl == null ? null : o.pnl >= 0;
+    return `<a class="cpos" href="${esc(fomoCoin(o.mint))}" target="_blank" rel="noopener">
+      <div class="cl"><div class="cn">${esc(nm)}<span class="ctag">Copy Trade Bot</span></div>
+        <div class="cs">nach @${esc(String(o.handle || "?").replace(/^@/, ""))} · Einstieg ${price(o.entry)} $ · ${usd(o.size)} · ${hhmm(o.opened_at)}</div></div>
+      <div class="cr"><div class="${up == null ? "" : up ? "pos-c" : "neg-c"}">${o.pnl == null ? "—" : susd(o.pnl)}</div>
+        <div class="cs ${up == null ? "" : up ? "pos-c" : "neg-c"}">${o.pct == null ? "kein Kurs" : spct(o.pct)}</div></div>
+    </a>`;
+  }
+  function copyStrategieBlock() {
+    const c = copyData(); if (!c) return "";
+    const open = c.open || [];
+    const body = open.length ? open.map(copyPosRow).join("")
+      : `<div class="empty">Keine offene Kopie${(c.followed || []).length ? " · folgt " + c.followed.map((f) => "@" + esc(f.handle)).join(", ") : " · heute kein Trader qualifiziert"}</div>`;
+    return `<div class="sec"><h2>Copy Trade Bot</h2><span class="aside">${modeBadgeTxt("Copy Trade Bot", c.mode)} · ${open.length} offen</span></div>
+      <div class="panel copyp">${body}</div>`;
+  }
+  /* ---- mode badges ("Strategy Bot PAPER" / "Strategy Bot LIVE", "Copy Trade Bot PAPER" / "Copy Trade Bot LIVE") */
+  function modeBadgeTxt(name, mode) { return `${name} ${String(mode || "paper").toUpperCase() === "LIVE" ? "LIVE" : "PAPER"}`; }
+  function modeBadge(name, mode) {
+    const live = String(mode || "paper").toUpperCase() === "LIVE";
+    return `<span class="mbadge ${live ? "live" : "paper"}">${esc(modeBadgeTxt(name, mode))}</span>`;
+  }
+  function walletLink(addr) {
+    if (!addr) return "";
+    const a = String(addr);
+    return `<a class="wal" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener" title="${esc(a)}">Wallet ${esc(a.slice(0, 4))}…${esc(a.slice(-4))}</a>`;
+  }
+  function stratData() { const t = T(); return (t && t.bots && t.bots.strategy && !t.bots.strategy.error) ? t.bots.strategy : null; }
+  function stratPosRow(o) {
+    const nm = cname(o); const up = o.pnl == null ? null : o.pnl >= 0;
+    const src = o.source === "dip" ? "Dip-Kauf" : o.source === "reentry" ? "Re-Entry" : "Signal";
+    return `<a class="cpos" href="${esc(fomoCoin(o.mint))}" target="_blank" rel="noopener">
+      <div class="cl"><div class="cn">${esc(nm)}<span class="ctag stag">Strategy Bot</span></div>
+        <div class="cs">${src}${o.score != null ? " · Score " + Math.round(o.score) : ""} · Einstieg ${price(o.entry)} $ · ${usd(o.size)} · ${hhmm(o.opened_at)}</div></div>
+      <div class="cr"><div class="${up == null ? "" : up ? "pos-c" : "neg-c"}">${o.pnl == null ? "—" : susd(o.pnl)}</div>
+        <div class="cs ${up == null ? "" : up ? "pos-c" : "neg-c"}">${o.pct == null ? "kein Kurs" : spct(o.pct)}</div></div>
+    </a>`;
+  }
+  function strategyCard() {
+    const c = stratData(); if (!c) return "";
+    const open = c.open || [], cl = c.closed || { n: 0, w: 0, l: 0, pnl: 0 };
+    const eq = num(c.equity), st = num(c.pot_start) || 50;
+    const eqCls = eq == null ? "" : eq >= st ? "g" : "r";
+    const next = c.enabled === false ? "aus" : "Test läuft";
+    return `<div class="tsec"><h2>Strategy Bot</h2><span class="aside">${esc(next)}</span></div>
+      <div class="ccard scard">
+        <div class="mrow">${modeBadge("Strategy Bot", c.mode)}${walletLink(c.wallet)}</div>
+        <div class="cgrid">
+          <div><div class="cl2">Topf jetzt</div><div class="cv ${eqCls}">${eq == null ? "—" : usd(eq)}</div><div class="cs">Start ${usd(st)} · frei ${c.pot_cash == null ? "—" : usd(c.pot_cash)}</div></div>
+          <div><div class="cl2">Offen</div><div class="cv">${open.length}</div><div class="cs">Positionen</div></div>
+          <div><div class="cl2">PnL</div><div class="cv ${num(c.pnl_total) == null ? "" : c.pnl_total >= 0 ? "g" : "r"}">${num(c.pnl_total) == null ? "—" : susd(c.pnl_total)}</div><div class="cs">${cl.n ? cl.w + " / " + cl.l + " W/L · " + susd(cl.pnl) : "noch keine geschlossen"}</div></div>
+        </div>
+        <div class="cfol"><span class="cl2">Folgt</span><span class="fm">den Signalen des Desks (Prompt 1–7) · ${c.skips ? c.skips + " übersprungen" : "wie gesendet"}</span></div>
+        ${open.length ? `<div class="copen">${open.map(stratPosRow).join("")}</div>` : ""}
+      </div>`;
+  }
+  function copyCard() {
+    const c = copyData(); if (!c) return "";
+    const open = c.open || [], cl = c.closed || { n: 0, w: 0, l: 0, pnl: 0 };
+    const eq = num(c.equity), st = num(c.pot_start) || 50;
+    const eqCls = eq == null ? "" : eq >= st ? "g" : "r";
+    const fol = (c.followed || []).length
+      ? c.followed.map((f) => `<span class="fh">@${esc(f.handle)}${f.old ? " <i>(läuft aus)</i>" : ""}</span>`).join("")
+      : `<span class="fm">${c.checked != null ? "heute kein Trader qualifiziert · " + esc(c.checked) + " geprüft" : "noch keine Auswahl"}</span>`;
+    const next = (c.enabled === false) ? "aus" : (c.killed ? "gestoppt" : "Test läuft");
+    return `<div class="tsec"><h2>Copy Trade Bot</h2><span class="aside">${esc(next)}</span></div>
+      <div class="ccard">
+        <div class="mrow">${modeBadge("Copy Trade Bot", c.mode)}${walletLink(c.wallet)}</div>
+        <div class="cgrid">
+          <div><div class="cl2">Topf jetzt</div><div class="cv ${eqCls}">${eq == null ? "—" : usd(eq)}</div><div class="cs">Start ${usd(st)} · frei ${c.pot_cash == null ? "—" : usd(c.pot_cash)}</div></div>
+          <div><div class="cl2">Offen</div><div class="cv">${open.length}</div><div class="cs">Kopien</div></div>
+          <div><div class="cl2">Geschlossen</div><div class="cv">${cl.n ? cl.w + " / " + cl.l : "—"}</div><div class="cs">${cl.n ? "W/L · " + susd(cl.pnl) : "noch keine"}</div></div>
+        </div>
+        <div class="cfol"><span class="cl2">Folgt</span>${fol}</div>
+        ${open.length ? `<div class="copen">${open.map(copyPosRow).join("")}</div>` : ""}
+      </div>`;
+  }
+
+  /* ------------------------------------------------------------ terminal (video style) */
+  let termRange = localStorage.getItem("desk_term_range") || "LIVE";
+  const TR_MS = { "1H": 3600e3, "4H": 4 * 3600e3, "1D": 86400e3, "1W": 7 * 86400e3 };
+  function T() { return (state && state.terminal && !state.terminal.error) ? state.terminal : null; }
+  function termMode() { return (state && state.mode) || "PAPER"; }
+  function termBal() { const b = state.balances || {}; return termMode() === "LIVE" ? num(b.LIVE) : num(b.PAPER); }
+  function usd(x) { const n = num(x); return n == null ? "—" : (n < 0 ? "−" : "") + "$" + nf2.format(Math.abs(n)); }
+  function susd(x) { const n = num(x); return n == null ? "—" : (n > 0 ? "+" : n < 0 ? "−" : "±") + "$" + nf2.format(Math.abs(n)); }
+  function berlinMidnight() {
+    const now = new Date();
+    const p = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).formatToParts(now);
+    const g = (t) => Number((p.find((x) => x.type === t) || {}).value || 0);
+    return now.getTime() - ((g("hour") % 24) * 3600 + g("minute") * 60 + g("second")) * 1000 - now.getMilliseconds();
+  }
+  function rangeStart(r) {
+    if (r === "LIVE") return berlinMidnight();
+    if (TR_MS[r]) return Date.now() - TR_MS[r];
+    return null;
+  }
+  function fomoCoin(mint) { return mint ? `https://fomo.family/coin?address=${encodeURIComponent(mint)}&chainId=1399811149&r=olli81&source=share_link` : null; }
+  function cname(x) { return String((x && (x.symbol || x.name)) || "Coin").trim(); }
+  function stripTitle(t) { return String(t || "").replace(/^(Bought|Sold|Stopped|Took profit|Rejected|Skipped|Sized|Scored|Audited|Passed|Dip-Kauf|Re-Entry)\s+/, "").trim(); }
+  function initials(s) { return esc(String(s || "?").replace(/[^\p{L}\p{N}]/gu, "").slice(0, 2).toUpperCase() || "?"); }
+  function coinAv(mint, label, badge) {
+    const ini = initials(label);
+    const img = mint ? `<img src="https://dd.dexscreener.com/ds-data/tokens/solana/${esc(mint)}.png" alt="" loading="lazy" onerror="this.remove()">` : "";
+    return `<div class="tav"><span class="ini">${ini}</span>${img}${badge ? `<i class="tbadge ${badge[0]}">${badge[1]}</i>` : ""}</div>`;
+  }
+  const SRC_DE = { new: "Neuer Coin", dip: "Dip-Kauf", reentry: "Re-Entry", copy: "Copy Trade Bot" };
+  const EXIT_TITLE = { stop: "Stop", trail: "Verkauft", tp1: "Teilgewinn", tp2: "Teilgewinn", timeout: "Timeout", manual: "Verkauft", pulled: "Liquidität weg", dev_dump: "Dev verkauft", no_price: "Kein Preis", lock_time: "Nacht vorbei" };
+
+  function termEvents() {
+    const t = T(); if (!t) return [];
+    const ev = [];
+    for (const tr of t.trades || []) {
+      const nm = cname(tr);
+      const src = tr.source || "new";
+      const buyTitle = src === "copy" ? `Copy Trade Bot ${nm}${tr.copied_from ? " nach @" + String(tr.copied_from).replace(/^@/, "") : ""}`
+        : src === "dip" ? `Dip-Kauf ${nm}` : src === "reentry" ? `Re-Entry ${nm}` : `Signal Kauf ${nm}`;
+      if (tr.opened_at) ev.push({ ts: tr.opened_at, type: "buy", mint: tr.mint, label: nm, title: buyTitle,
+        sub: `${SRC_DE[src] || src} · ${tr.mode === "LIVE" ? "Signal" : "Paper"}`, r1: usd(tr.size), r2: tr.status === "open" ? "offen" : "", tone: "" });
+      if (tr.closed_at) {
+        const p = num(tr.pnl);
+        ev.push({ ts: tr.closed_at, type: "sell", mint: tr.mint, label: nm,
+          title: `${EXIT_TITLE[tr.exit] || "Verkauft"} ${nm}`, sub: `Risiko · ${SRC_DE[src] || src}`,
+          r1: susd(p), r2: spct(tr.pct), tone: p == null ? "" : p >= 0 ? "pos" : "neg", win: p != null && p >= 0 });
+      }
+    }
+    for (const r of t.rejected || []) {
+      const who = String(r.agent || "").startsWith("Analyst") ? "Analyst" : r.agent === "Auditor" ? "Prüfer" : (r.agent || "");
+      const why = String(r.detail || "").replace(/^[^·]*·\s*/, "");
+      if (r.kind === "copy_skip") { ev.push({ ts: r.ts, type: "rej", mint: r.mint, label: "Copy", title: String(r.title || "Copy übersprungen"),
+        sub: "Copy Trade Bot · " + String(r.detail || "").replace(/^Copy · /, ""), r1: "Übersprungen", r2: "", tone: "mut" }); continue; }
+      ev.push({ ts: r.ts, type: "rej", mint: r.mint, label: stripTitle(r.title), title: `Abgelehnt ${stripTitle(r.title)}`,
+        sub: `${who} · ${why}`, r1: "Übersprungen", r2: "", tone: "mut" });
+    }
+    ev.sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+    return ev;
+  }
+  function evRow(e) {
+    const badge = e.type === "buy" ? ["b", "↗"] : e.type === "rej" ? ["x", "×"] : [e.win ? "g" : "r", e.win ? "✓" : "↘"];
+    const href = fomoCoin(e.mint);
+    return `<a class="trow" ${href ? `href="${esc(href)}" target="_blank" rel="noopener"` : ""}>
+      ${coinAv(e.mint, e.label, badge)}
+      <div class="tm"><div class="tt">${esc(e.title)}</div><div class="ts">${esc(e.sub)} · ${hhmm(e.ts)}</div></div>
+      <div class="tr2"><div class="v ${e.tone}">${esc(e.r1)}</div><div class="s ${e.tone === "mut" ? "" : e.tone}">${esc(e.r2 || "")}</div></div>
+    </a>`;
+  }
+
+  function botRows() {
+    const t = T() || {}; const b = t.bots || {};
+    const st = state.settings || {};
+    const open = (state.positions || []).length;
+    const L = (k) => (b[k] && b[k].last) || null;
+    const ago = (ts) => ts ? hhmm(ts) : "";
+    const rows = [];
+    const hbDot = (k) => { const a = hbAge(k); return a == null ? "idle" : a < 180 ? "ok" : a < 900 ? "warn" : "bad"; };
+    // Scanner
+    { const l = L("scanner"); const k = (b.scanner || {}).kinds24 || {};
+      rows.push({ k: "scanner", n: "Scanner", ic: "📡", c: "#30d158",
+        sub: l ? `<b>${esc(stripTitle(l.title).slice(0, 22))}</b> · ${l.kind === "passed" ? "ok → Prüfer" : esc(l.detail || "raus")}` : "idle",
+        v: `${k.passed || 0} ok · ${(b.scanner || {}).n24 || 0}`, vs: "24h" }); }
+    { const l = L("auditor");
+      const ok = l && l.kind === "audited";
+      rows.push({ k: "auditor", n: "Prüfer", ic: "🛡️", c: "#ff453a",
+        sub: l ? `<b>${esc(stripTitle(l.title).slice(0, 20))}</b> ${ok ? '<span class="g">8/8 · bestanden</span>' : "· " + esc(String(l.detail || "").replace(/^Auditor · /, ""))}` : "idle",
+        v: l ? (ok ? "bestanden" : "abgelehnt") : "idle", vc: l ? (ok ? "g" : "r") : "", vs: l ? ago(l.ts) : "" }); }
+    { const l = L("analyst"); const rej = l && l.kind === "rejected";
+      rows.push({ k: "analyst", n: "Analyst", ic: "📊", c: "#ffd60a",
+        sub: l ? `<b>${esc(stripTitle(l.title).slice(0, 20))}</b> · ${esc(String(l.detail || "").replace(/^Analyst \(rules\) · /, ""))}` : "idle",
+        v: l ? (rej ? "abgelehnt" : "bewertet") : "idle", vc: l ? (rej ? "r" : "g") : "", vs: l ? ago(l.ts) : "" }); }
+    { const l = L("brain"); const m = l && String(l.right || "").match(/\$[\d.]+/);
+      rows.push({ k: "brain", n: "Brain", ic: "🧠", c: "#bf5af2",
+        sub: l ? `Größe <b>${esc(stripTitle(l.title).slice(0, 20))}</b> · ${esc(l.detail || "")}` : "idle",
+        v: m ? usd(m[0].slice(1)) : "idle", vs: l ? ago(l.ts) : "" }); }
+    { const l = L("executor");
+      rows.push({ k: "executor", n: "Executor", ic: "⚡", c: "#5e5ce6",
+        sub: l ? `<span class="g">✓ Signal</span> <b>${esc(stripTitle(l.title).slice(0, 20))}</b> · Telegram` : "idle",
+        v: `${(b.executor || {}).n24 || 0} Signale`, vs: "24h" }); }
+    { const l = L("risk");
+      rows.push({ k: "risk", n: "Risiko", ic: "🚨", c: "#ff9f0a",
+        sub: `${open ? `Wacht über ${open}` : (l ? `${esc(stripTitle(l.title).slice(0, 16))} ${esc(String(l.right || "").split("/").pop().trim())}` : "Bereit")} <code>stop −${esc(st.stop_pct)}%</code><code>trail ${esc(st.trail_pct)}%</code>`,
+        v: `${open} offen`, vs: l ? "zuletzt " + ago(l.ts) : "" }); }
+    { const d = b.dip || {}; const l = d.last;
+      rows.push({ k: "dip", n: "Dip", ic: "📉", c: "#64d2ff",
+        sub: `${d.watch || 0} beobachtet${l ? ` · zuletzt <b>${esc(cname(l).slice(0, 14))}</b> ${l.pct != null ? spct(l.pct) : ""}` : ""} <code>stop −${esc(st.dip_stop_pct)}%</code>`,
+        v: `${d.n24 || 0} Käufe`, vs: "24h" }); }
+    { const d = b.reentry || {}; const l = d.last;
+      rows.push({ k: "reentry", n: "Re-Entry", ic: "🔁", c: "#30d158",
+        sub: l ? `zuletzt <b>${esc(cname(l))}</b> · ${hhmm(l.opened_at)}` : (st.reentry_enabled === false ? "aus" : "wartet auf Runner"),
+        v: d.n24 ? `${d.n24} · 24h` : "idle", vs: "" }); }
+    { const c = b.copy || {};
+      const sel = (c.selected || []).map((h) => "@" + String(h).replace(/^@/, ""));
+      rows.push({ k: "copy", n: "Copy Trade Bot", ic: "🤖", c: "#5ac8fa", dot: c.killed ? "bad" : (c.enabled ? "warn" : "idle"),
+        sub: (sel.length ? `<span class="h">${esc(sel.join(" "))}</span>` : `kein Trader qualifiziert${c.checked != null ? " · " + esc(c.checked) + " geprüft" : ""}`) +
+          ` <code>stop −${esc(st.copy_stop_pct != null ? st.copy_stop_pct : 25)}%</code><code>verkauft er = raus</code>`,
+        v: c.pot_cash != null ? usd(c.pot_cash) : "—", vs: c.killed ? "gestoppt" : "PAPER" }); }
+    { const c = b.strategy || {};
+      rows.push({ k: "strategy", n: "Strategy Bot", ic: "🧠", c: "#bf5af2", dot: c.enabled === false ? "idle" : "warn",
+        sub: `folgt den Desk-Signalen <code>Prompt 1–7</code><code>${(c.open || []).length} offen</code>`,
+        v: c.equity != null ? usd(c.equity) : "—", vs: "PAPER" }); }
+    return rows.map((r) => Object.assign(r, { dot: r.dot || hbDot(r.k) }));
+  }
+
+  function termHeader() {
+    const mode = termMode();
+    const age = ageSec(state.ts);
+    const stale = age != null && age > 600;
+    const open = (state.positions || []).length;
+    return `<header class="thead">
+      <div class="r1"><div class="ttl">olli81 <span>Terminal</span></div>
+        <span class="lpill ${stale ? "bad" : mode === "LIVE" ? "" : "paper"}"><i></i>${stale ? "Offline?" : mode === "LIVE" ? "Live" : "Paper"}</span></div>
+      <div class="r2"><span><b>fomo</b> · ${open} offen</span><span id="termClock">${new Date().toLocaleTimeString("de-DE", { timeZone: TZ, hour: "2-digit", minute: "2-digit" })}</span></div>
+    </header>`;
+  }
+
+  function viewTerminal() {
+    if (!state) return "";
+    const t = T();
+    const bal = termBal();
+    const ms = modeStats(termMode());
+    const tp = ms ? num(ms.today_pnl) : null;
+    let pnlLine = "";
+    if (bal != null && tp != null && bal - tp > 0) {
+      const start = bal - tp, pct = tp / start * 100, mult = bal / start;
+      const up = tp >= 0;
+      pnlLine = `<div class="tpnl ${up ? "up" : "dn"}"><span>${up ? "▲" : "▼"} ${susd(tp)} (${spct(pct, 2)})</span>
+        <span class="mult">${mult.toLocaleString("de-DE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}×</span><span class="lbl">heute</span></div>`;
+    }
+    const balTxt = bal == null ? "—" : "$" + nf2.format(bal);
+    const ranges = ["LIVE", "1H", "4H", "1D", "1W", "ALL"].map((r) =>
+      `<button data-trange="${r}" class="${termRange === r ? "on" : ""}">${r === "LIVE" ? "● LIVE" : r}</button>`).join("");
+    // live chart card
+    let live = "";
+    const c = t && t.chart;
+    if (c && c.pool) {
+      const isOpen = c.status === "open";
+      const cap = isOpen
+        ? `Gekauft ${esc(cname(c))} · ${usd(c.size)}${c.audit_passed ? ' · <span class="g">✓ geprüft</span>' : ""}`
+        : `Zuletzt ${esc(cname(c))} · <span class="${num(c.pct) >= 0 ? "g" : "r"}">${spct(c.pct)}</span> · ${esc(EXIT_TITLE[c.exit] || "geschlossen")}`;
+      live = `<div class="tsec"><h2>Live-Chart</h2><a class="aside" href="${esc(fomoCoin(c.mint))}" target="_blank" rel="noopener">${esc(cname(c))} in FOMO</a></div>
+        <div class="tlive">
+          <div class="tframe"><iframe src="https://dexscreener.com/solana/${esc(c.pool)}?embed=1&theme=dark&info=0&trades=0&chartLeftToolbar=0&chartTimeframesToolbar=0&chartDefaultOnMobile=1&chartTheme=dark&chartType=usd&interval=5" loading="lazy" title="Chart"></iframe>
+          <div class="ltop"><span><i class="${isOpen ? "on" : ""}"></i>${isOpen ? "Live · offene Position" : "Letzte Position"}</span><span class="${isOpen ? "o" : ""}">${isOpen ? "Risiko · wacht" : "geschlossen"}</span></div></div>
+          <div class="lcap">${cap}</div>
+        </div>`;
+    }
+    const rows = botRows();
+    const active = rows.filter((r) => r.dot === "ok").length;
+    const bots = rows.map((r) => `<div class="brow">
+        <div class="bav" style="--c:${r.c}"><span>${r.ic}</span></div>
+        <div class="bm"><div class="bn"><i class="d ${r.dot}"></i>${esc(r.n)}</div><div class="bs">${r.sub}</div></div>
+        <div class="bv"><div class="${r.vc || ""}">${esc(r.v)}</div>${r.vs ? `<small>${esc(r.vs)}</small>` : ""}</div>
+      </div>`).join("");
+    const ev = termEvents();
+    const feed = ev.length ? ev.slice(0, 8).map(evRow).join("") : `<div class="tempty">Noch keine Aktivität.</div>`;
+    return `${termHeader()}
+      <div class="tbal">${balTxt}</div>
+      ${pnlLine || `<div class="tpnl"><span class="lbl">${termMode() === "LIVE" ? "Live-Stack aus deiner FOMO-Wallet" : "Paper-Stack"}</span></div>`}
+      <div class="tchart"><canvas id="tchart"></canvas><div class="tcl" id="tchartLbl"></div></div>
+      <div class="tranges">${ranges}</div>
+      ${live}
+      <div class="tsec"><h2>Bots</h2><span class="aside g">${active} aktiv</span></div>
+      <div class="bots">${bots}</div>
+      ${strategyCard()}
+      ${copyCard()}
+      <div class="tsec"><h2>Aktivität</h2><a class="aside g" data-go="/activity" href="#">Alle</a></div>
+      <div class="tfeed">${feed}</div>
+      <div class="tfoot">Der Desk handelt nicht selbst · Signale per Telegram · Stand ${hhmm(state.ts, true)}</div>`;
+  }
+
+  function viewActivity() {
+    if (!state) return "";
+    const ev = termEvents();
+    return `${termHeader()}
+      <div class="tsec" style="margin-top:8px"><h2>Aktivität</h2><a class="aside g" data-go="/terminal" href="#">‹ Terminal</a></div>
+      <div class="tfeed">${ev.length ? ev.slice(0, 120).map(evRow).join("") : `<div class="tempty">Noch keine Aktivität.</div>`}</div>
+      <div class="tfoot">Kauf-/Verkauf-Signale, Stops und abgelehnte Coins · Zeiten in Berlin</div>`;
+  }
+
+  function drawTermChart() {
+    const cnv = document.getElementById("tchart"); if (!cnv) return;
+    const ms = modeStats(termMode());
+    const eqAll = ((ms && ms.equity) || []).map((p) => ({ t: toDate(p.ts), v: num(p.v) })).filter((p) => p.t && p.v != null);
+    const r = cnv.getBoundingClientRect(); const dpr = window.devicePixelRatio || 1;
+    cnv.width = Math.max(1, r.width * dpr); cnv.height = Math.max(1, r.height * dpr);
+    const ctx = cnv.getContext("2d"); ctx.scale(dpr, dpr);
+    const W = r.width, H = r.height;
+    ctx.clearRect(0, 0, W, H);
+    const lbl = document.getElementById("tchartLbl");
+    const now = Date.now();
+    let t0 = rangeStart(termRange);
+    if (t0 == null) t0 = eqAll.length ? eqAll[0].t.getTime() - 60e3 : now - 86400e3;
+    const before = eqAll.filter((p) => p.t.getTime() < t0);
+    const startV = before.length ? before[before.length - 1].v : 0;
+    const inR = eqAll.filter((p) => p.t.getTime() >= t0);
+    const pts = [{ x: t0, v: startV }].concat(inR.map((p) => ({ x: p.t.getTime(), v: p.v }))).concat([{ x: now, v: inR.length ? inR[inR.length - 1].v : startV }]);
+    const delta = pts[pts.length - 1].v - startV;
+    if (lbl) lbl.innerHTML = `PnL geschlossen · ${termRange === "LIVE" ? "heute" : termRange} <b class="${delta >= 0 ? "g" : "r"}">${susd(delta)}</b>`;
+    let lo = Math.min(...pts.map((p) => p.v)), hi = Math.max(...pts.map((p) => p.v));
+    if (hi - lo < 0.5) { const m = (hi + lo) / 2; lo = m - 0.5; hi = m + 0.5; }
+    const padT = 34, padB = 10;
+    const X = (x) => 4 + (x - t0) / Math.max(1, now - t0) * (W - 14);
+    const Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (H - padT - padB);
+    const col = delta >= 0 ? "#30d158" : "#ff453a";
+    // step path
+    ctx.beginPath();
+    pts.forEach((p, i) => { if (i === 0) ctx.moveTo(X(p.x), Y(p.v)); else { ctx.lineTo(X(p.x), Y(pts[i - 1].v)); ctx.lineTo(X(p.x), Y(p.v)); } });
+    ctx.save();
+    ctx.lineTo(X(now), H); ctx.lineTo(X(t0), H); ctx.closePath();
+    const g = ctx.createLinearGradient(0, padT, 0, H);
+    g.addColorStop(0, delta >= 0 ? "rgba(48,209,88,.28)" : "rgba(255,69,58,.24)"); g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g; ctx.fill(); ctx.restore();
+    ctx.beginPath();
+    pts.forEach((p, i) => { if (i === 0) ctx.moveTo(X(p.x), Y(p.v)); else { ctx.lineTo(X(p.x), Y(pts[i - 1].v)); ctx.lineTo(X(p.x), Y(p.v)); } });
+    ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.stroke();
+    // end dot
+    const e = pts[pts.length - 1];
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(X(e.x) - 1, Y(e.v), 4, 0, 7); ctx.fill();
+    // buy markers (last 3 in range)
+    const t = T();
+    const buys = ((t && t.trades) || []).filter((x) => x.source !== "copy" && (x.mode || "PAPER") === termMode() && toDate(x.opened_at) && toDate(x.opened_at).getTime() >= t0)
+      .sort((a, b) => String(a.opened_at).localeCompare(String(b.opened_at))).slice(-3);
+    ctx.font = "600 11px -apple-system, BlinkMacSystemFont, Inter, sans-serif";
+    const rowRight = [-1e9, -1e9];
+    buys.forEach((bq) => {
+      const bx = X(toDate(bq.opened_at).getTime());
+      const vAt = (pts.filter((p) => p.x <= toDate(bq.opened_at).getTime()).pop() || pts[0]).v;
+      const by = Y(vAt);
+      const txt = "Gekauft " + cname(bq).slice(0, 12);
+      const tw = ctx.measureText(txt).width + 14;
+      let px = Math.min(Math.max(2, bx - tw / 2), W - tw - 2);
+      let row = px >= rowRight[0] + 4 ? 0 : px >= rowRight[1] + 4 ? 1 : (rowRight[0] <= rowRight[1] ? 0 : 1);
+      const py = 4 + row * 20;
+      rowRight[row] = px + tw;
+      ctx.strokeStyle = "rgba(90,200,250,.35)"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(bx, py + 17); ctx.lineTo(bx, by); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "#0a2a3a"; ctx.strokeStyle = "rgba(90,200,250,.6)";
+      const rr = 8; ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(px, py, tw, 17, rr); else ctx.rect(px, py, tw, 17);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = "#cfefff"; ctx.fillText(txt, px + 7, py + 12.5);
+      ctx.fillStyle = "#0a84ff"; ctx.beginPath(); ctx.arc(bx, by, 3.5, 0, 7); ctx.fill();
+    });
+  }
+
+  /* ------------------------------------------------------------ render */
+  let lastRoute = null;
+  function render() {
+    const root = document.getElementById("app");
+    const { route, mint } = parseHash();
+    if (error && !state) {
+      root.innerHTML = shell(`<div class="error" id="error-state">${esc(error)}</div>`, "home");
+      bind(root);
+      return;
+    }
+    let inner = "", tab = route;
+    if (route === "terminal" || route === "activity") {
+      const y0 = window.scrollY;
+      root.innerHTML = termShell(route === "activity" ? viewActivity() : viewTerminal());
+      bind(root);
+      if (route === lastRoute) window.scrollTo(0, y0);
+      lastRoute = route;
+      requestAnimationFrame(() => drawAll(route));
+      return;
+    }
+    if (route === "agents") inner = viewAgents();
+    else if (route === "stats") inner = viewStats();
+    else if (route === "radar") inner = viewRadar();
+    else if (route === "auditor") { inner = viewAuditor(mint); tab = "agents"; }
+    else if (route === "coin") { inner = viewCoin(mint); tab = "home"; }
+    else if (route === "account") inner = viewAccount();
+    else { inner = viewHome(); tab = "home"; }
+    if (error) inner = `<div class="error" style="margin-bottom:8px">${esc(error)} Zeige letzten Stand.</div>` + inner;
+    const y = window.scrollY;
+    const openK = new Set(Array.from(root.querySelectorAll("details[open][data-k]")).map((d) => d.getAttribute("data-k")));
+    root.innerHTML = shell(inner, tab);
+    root.querySelectorAll("details[data-k]").forEach((d) => { if (openK.has(d.getAttribute("data-k"))) d.open = true; });
+    bind(root);
+    if (route === lastRoute) window.scrollTo(0, y);
+    lastRoute = route;
+    requestAnimationFrame(() => drawAll(route));
+  }
+
+  function bind(root) {
+    root.querySelectorAll("[data-go]").forEach((b) => {
+      b.addEventListener("click", (e) => { e.preventDefault(); go(b.getAttribute("data-go")); });
+    });
+    root.querySelectorAll("[data-stat]").forEach((b) => {
+      b.addEventListener("click", () => { statMode = b.getAttribute("data-stat"); localStorage.setItem(LS_STAT, statMode); render(); });
+    });
+    root.querySelectorAll("[data-trange]").forEach((b) => {
+      b.addEventListener("click", () => { termRange = b.getAttribute("data-trange"); localStorage.setItem("desk_term_range", termRange); render(); });
+    });
+    const more = root.querySelector("#tapeMore");
+    if (more) more.addEventListener("click", () => { tapeAll = !tapeAll; render(); });
+  }
+
+  // keep the "updated x ago" label fresh without re-rendering
+  setInterval(() => {
+    if (!state) return;
+    const a = ageSec(state.ts);
+    const t = document.getElementById("updTxt"), d = document.getElementById("updDot");
+    if (t) t.textContent = hhmm(state.ts, true) + " · vor " + ageTxt(a);
+    if (d) d.className = "dot " + dotCls(a, 150, 600);
+    const [sc, stxt] = serverState();
+    const sp = document.getElementById("srvPill"), st = document.getElementById("srvTxt");
+    if (sp) { sp.className = "spill " + sc; sp.firstElementChild.className = "dot " + sc; }
+    if (st) st.textContent = stxt;
+    const tc = document.getElementById("termClock");
+    if (tc) tc.textContent = new Date().toLocaleTimeString("de-DE", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+  }, 5000);
+
+  let rz = null;
+  window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => drawAll(parseHash().route), 150); });
+  window.addEventListener("hashchange", () => {
+    const h = parseHash();
+    if (h.data) localStorage.setItem(LS_KEY, h.data);
+    window.scrollTo(0, 0);
+    render();
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+  load();
+  setInterval(load, POLL_MS);
+})();
