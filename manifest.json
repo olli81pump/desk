@@ -1,0 +1,8 @@
+{
+  "name": "olli81",
+  "short_name": "olli81",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#07090d",
+  "theme_color": "#07090d"
+}
